@@ -983,6 +983,18 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(content=content):
                 self.assertTrue(self.helper["secret_text_risk"](content))
 
+    def test_secret_detector_rejects_separated_numeric_template_literal(
+        self,
+    ) -> None:
+        content = "pass" + "word = decode(`${12_345_678}`)"
+
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                content,
+                javascript_dialect="typescript",
+            )
+        )
+
     def test_secret_detector_rejects_op_backtick_shell_fallbacks(self) -> None:
         content = (
             "pass"
@@ -1011,6 +1023,43 @@ class AutoreviewHardeningTests(unittest.TestCase):
         )
 
         self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_allows_supported_credential_member_chains(
+        self,
+    ) -> None:
+        for dialect, value in (
+            ("csharp", "credentials.Value"),
+            ("csharp", "options->Credentials.Value"),
+            ("java", "options.Credentials.Current"),
+            ("java", "credentialStore::getPassword"),
+            ("kotlin", "options.Credentials.Current"),
+            ("kotlin", "credentials::password"),
+            ("python", "credentials.value"),
+            ("c-family", "Credentials::Value"),
+            ("c-family", "options->credentials.Value"),
+        ):
+            with self.subTest(dialect=dialect, value=value):
+                self.assertFalse(
+                    self.helper["secret_text_risk"](
+                        f"password = {value};",
+                        javascript_dialect=dialect,
+                    )
+                )
+
+    def test_secret_detector_scans_c_family_member_call_arguments(self) -> None:
+        fixture_value = "CorrectHorse7" + "Battery"
+        for expression in (
+            f'credentials->get("{fixture_value}")',
+            f'credentials::get("{fixture_value}")',
+            f'credentials->get()->decode("{fixture_value}")',
+        ):
+            with self.subTest(expression=expression):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        f"password = {expression}",
+                        javascript_dialect="c-family",
+                    )
+                )
 
     def test_secret_detector_rejects_reference_shaped_fallback_literals(self) -> None:
         content = (
@@ -1247,6 +1296,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + f'ken = provider.issue_token(value<Array<number>> / total || "{literal_value}"[0] / count)',
             "var await = value; to"
             + f'ken = provider.issue_token(await / total || "{literal_value}"[0] / count)',
+            "function f(await, d) { to"
+            + 'ken = provider.issue_token(await / 2, "Abc\\\\123Def456" / d) }',
             "var yield = value; to"
             + f'ken = provider.issue_token(yield / total || "{literal_value}"[0] / count)',
             "to"
@@ -1413,8 +1464,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "to"
             + 'ken = get_token(a / fn(x) / b)\nreport("actual-production-secret")',
             "to"
-            + 'ken = get_token(await /\\)"actual-production-secret"/, process.env.TOKEN)',
-            "to"
             + 'ken = get_token(await /\\)/, /x)"actual-production-secret"/, process.env.TOKEN)',
             "to"
             + "ken = get_token(await /\\)/, process.env.TOKEN) || process.env.FALLBACK",
@@ -1426,8 +1475,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
     def test_regex_parser_accepts_expression_keyword_contexts(self) -> None:
         for content in (
+            "async function f() { return await /\\)/; }",
             "class C extends /\\)/.constructor {}",
             "export default /\\)/;",
+            "function* f() { return yield /\\)/; }",
         ):
             with self.subTest(content=content):
                 start = content.index("/")
@@ -1546,6 +1597,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "to" + 'ken = input ("Enter API to' + 'ken: ")',
             "api" + 'Key = prompt("Enter API key: ")',
             "api" + 'Key = prompt("Enter API key: ", defaultApiKey)',
+            "pass" + 'word = ui.prompt("Enter password for Service2")',
+            "pass" + 'word = ui?.prompt("Enter password for Service2")',
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
@@ -1593,6 +1646,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "pass"
             + "word = in"
             + 'put("correct horse battery staple?")',
+            "pass"
+            + 'word = attacker.prompt("Enter password for Horse7battery")',
             "access_"
             + "to"
             + 'ken = custom_client.get_token("correct-horse-battery-staple")',
@@ -2470,6 +2525,23 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.helper["javascript_review_dialect"]("module.cts"),
             "typescript",
         )
+        self.assertIsNone(self.helper["javascript_review_dialect"]("module.m"))
+        self.assertEqual(
+            self.helper["javascript_review_dialect"]("module.mm"),
+            "c-family",
+        )
+        for rel, dialect in (
+            ("module.kt", "kotlin"),
+            ("module.kts", "kotlin"),
+            ("module.groovy", "groovy"),
+            ("module.gradle", "groovy"),
+            ("module.java", "java"),
+        ):
+            with self.subTest(rel=rel):
+                self.assertEqual(
+                    self.helper["javascript_review_dialect"](rel),
+                    dialect,
+                )
 
     def test_secret_detector_allows_generated_fixture_credentials(self) -> None:
         property_name = "pass" + "word"
@@ -3878,6 +3950,52 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotIn(fixture_value, redacted_patch)
         self.assertIn('+  || "redacted";', redacted_patch)
 
+    def test_review_patch_redacts_multiline_triple_fallback_literal(self) -> None:
+        first = "Prod" + "Secret123"
+        second = "Tail" + "456"
+        key = "password"
+        quote = '"' * 3
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            f"+{key} = primary or {quote}{first}\n"
+            f"+{second}{quote}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertNotIn(first, redacted_patch)
+        self.assertNotIn(second, redacted_patch)
+        self.assertIn(f"{quote}redacted\n+redacted{quote}", redacted_patch)
+
+    def test_review_patch_preserves_python_fallback_interpolation_source(
+        self,
+    ) -> None:
+        key = "pass" + "word"
+        source = f'{key} = primary or f"{{exfiltrate()}}"'
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.py"],
+                patch,
+            ),
+            patch,
+        )
+
     def test_review_patch_preserves_and_rejects_ambiguous_multiline_call_value(
         self,
     ) -> None:
@@ -3912,6 +4030,4609 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertIn("+pass" + "word = decode(", validated_patch)
         self.assertIn('+    "redacted",', validated_patch)
 
+    def test_review_patch_redacts_valid_multiline_template_call(self) -> None:
+        first = "".join(("Abc", "123"))
+        second = "".join(("Def", "456"))
+        key = "pass" + "word"
+        source = f"{key} = decode(`{first}\n{second}`);"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1,2 @@\n"
+            + "".join(f"+{line}\n" for line in source.splitlines())
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(first, redacted_patch)
+        self.assertNotIn(second, redacted_patch)
+        self.assertIn("decode(`redacted-a\n+redacted-b`)", redacted_patch)
+
+    def test_review_patch_redacts_complete_escaped_call_literal(self) -> None:
+        fixture_value = 'abc123\\"); /*SensitiveTail9*/ //'
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = decode("{fixture_value}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn("SensitiveTail9", redacted_patch)
+        self.assertIn('decode("redacted")', redacted_patch)
+
+    def test_review_patch_redacts_nested_template_call_literal(self) -> None:
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + "word = decode(`abc1234${`SensitiveTail9${exfiltrate()}`}`);\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn("SensitiveTail9", redacted_patch)
+        self.assertIn("exfiltrate()", redacted_patch)
+        self.assertIn(
+            "decode(`redacted-a${`redacted-b${exfiltrate()}`}`)",
+            redacted_patch,
+        )
+
+    def test_review_patch_redacts_multiline_template_literal_per_line(self) -> None:
+        first = "Abc123"
+        second = "Def456"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1,2 @@\n"
+            + "+pass"
+            + f"word = decode(`{first}\n"
+            + f"+{second}`);\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(first, redacted_patch)
+        self.assertNotIn(second, redacted_patch)
+        self.assertIn("decode(`redacted-a\n+redacted-b`)", redacted_patch)
+
+    def test_review_patch_redacts_bigint_template_interpolation_literal(self) -> None:
+        bigint = "12345678901234567890n"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f"word = decode(`prefix${{{bigint}}}`);\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(bigint, redacted_patch)
+        self.assertIn("${redacted-b}", redacted_patch)
+
+    def test_review_patch_redacts_numeric_looking_template_text(self) -> None:
+        fixture_value = "123456789012.0"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f"word = decode(`{fixture_value}`);\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn("decode(`redacted`)", redacted_patch)
+
+    def test_review_patch_repeats_numeric_looking_template_redaction(self) -> None:
+        fixture_value = "123456789012.0"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1,2 @@\n"
+            f"+password = decode(`{fixture_value}`);\n"
+            f'+log("{fixture_value}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('+log("redacted");', redacted_patch)
+
+    def test_review_patch_redacts_integral_javascript_decimal_literals(
+        self,
+    ) -> None:
+        for fixture_value in ("12345678.0", "1.2345678e7"):
+            with self.subTest(fixture_value=fixture_value):
+                patch = (
+                    "diff --git a/runtime.ts b/runtime.ts\n"
+                    "--- a/runtime.ts\n"
+                    "+++ b/runtime.ts\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+password = decode(`${{{fixture_value}}}`);\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.ts"],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn("decode(`${redacted}`)", redacted_patch)
+
+    def test_review_patch_preserves_numeric_source_beside_secret_literal(
+        self,
+    ) -> None:
+        numeric_source = "0.123456789012"
+        fixture_value = "ProdSecret123"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = decode(`${{{numeric_source}}}`, "{fixture_value}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertIn(f"${{{numeric_source}}}", redacted_patch)
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('"redacted"', redacted_patch)
+
+    def test_review_patch_redacts_bigint_before_member_access(self) -> None:
+        fixture_value = "12345678n"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + "word = decode(`${"
+            + fixture_value
+            + ".toString()}`);\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn("${redacted.toString()}", redacted_patch)
+
+    def test_review_patch_redacts_decimal_integer_before_member_access(self) -> None:
+        fixture_value = "12345678"
+        cases = (
+            (
+                "runtime.ts",
+                "`prefix${" + fixture_value + "..toString()}`",
+                "..toString()}",
+            ),
+            (
+                "runtime.cs",
+                '$"prefix{' + fixture_value + '.ToString()}"',
+                ".ToString()}",
+            ),
+            (
+                "runtime.kt",
+                '"prefix${' + fixture_value + '.toString()}"',
+                ".toString()}",
+            ),
+            (
+                "runtime.groovy",
+                '"prefix${' + fixture_value + '.toString()}"',
+                ".toString()}",
+            ),
+        )
+        for rel, literal, expected in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    + "+pass"
+                    + f"word = decode({literal})\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn("redacted", redacted_patch)
+                self.assertIn(expected, redacted_patch)
+
+    def test_review_patch_preserves_template_interpolation_source_expression(self) -> None:
+        literal = "10000000"
+        expression = f"process.env.API_TOKEN+{literal}"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f"word = decode(`${{{expression}}}`);\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(literal, redacted_patch)
+        self.assertIn("${process.env.API_TOKEN+redacted}", redacted_patch)
+
+    def test_review_patch_redacts_template_comment_and_regex_literals(self) -> None:
+        fixture_value = "Abc123Def456"
+        for expression, expected in (
+            (f"value /* {fixture_value} */", "value /* redacted */"),
+            (f"/{fixture_value}/.source", "/redacted/.source"),
+            (f"await /{fixture_value}/", "await /redacted/"),
+            (f"yield /{fixture_value}/", "yield /redacted/"),
+        ):
+            with self.subTest(expression=expression):
+                patch = (
+                    "diff --git a/runtime.ts b/runtime.ts\n"
+                    "--- a/runtime.ts\n"
+                    "+++ b/runtime.ts\n"
+                    "@@ -0,0 +1 @@\n"
+                    + "+pass"
+                    + f"word = decode(`${{{expression}}}`);\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.ts"],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn(expected, redacted_patch)
+
+    def test_review_patch_redacts_javascript_regex_source(self) -> None:
+        fixture_value = "Abc123Def456"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            f"+password = decode(/{fixture_value}/.source);\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn("decode(/redacted/.source)", redacted_patch)
+
+    def test_review_patch_stops_javascript_regex_at_unicode_terminator(
+        self,
+    ) -> None:
+        fixture_value = "Abc" + "1234"
+        key = "pass" + "word"
+        separator = chr(0x2028)
+        source = f"{key} = decode(/x{separator}`{fixture_value}`/)"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn(separator, redacted_patch)
+
+    def test_review_patch_redacts_aggregated_java_and_c_family_literals(
+        self,
+    ) -> None:
+        key = "password"
+        first = "abc" + "123"
+        second = "def" + "456"
+        cases = (
+            (
+                "Runtime.java",
+                f'{key} = decode("{first}" + "{second}");',
+            ),
+            (
+                "runtime.cpp",
+                f'{key} = decode("{first}" "{second}");',
+            ),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(first, redacted_patch)
+                self.assertNotIn(second, redacted_patch)
+
+    def test_review_patch_redacts_alphabetic_template_comment_literal(self) -> None:
+        fixture_value = "abcdefghijklmnop"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = decode(`${{value /* "{fixture_value}" */}}`)\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('/* "redacted" */', redacted_patch)
+
+    def test_review_patch_preserves_benign_template_interpolation_comments(
+        self,
+    ) -> None:
+        comment = "credential comes from the vault"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f"word = decode(`${{value /* {comment} */}}`);\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertIn(comment, redacted_patch)
+
+    def test_review_patch_redacts_public_call_template_comment(self) -> None:
+        fixture_value = "Abc1234"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f"word = prompt(`${{value/*{fixture_value}*/}}`);\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn("${value/*redacted*/}", redacted_patch)
+
+    def test_review_patch_preserves_qualified_public_prompt_text(self) -> None:
+        for target in ("ui.prompt", "ui?.prompt"):
+            source = f'{target}("Enter password for Service2")'
+            with self.subTest(target=target):
+                patch = (
+                    "diff --git a/runtime.ts b/runtime.ts\n"
+                    "--- a/runtime.ts\n"
+                    "+++ b/runtime.ts\n"
+                    "@@ -0,0 +1 @@\n"
+                    + "+pass"
+                    + f"word = {source};\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.ts"],
+                    patch,
+                )
+
+                self.assertIn(source, redacted_patch)
+
+    def test_review_patch_redacts_structured_public_prompt_literals(self) -> None:
+        fixture_value = "Abc123" + "Def456"
+        key = "password"
+        quote = '"' * 3
+        cases = (
+            (
+                "Runtime.java",
+                f"String {key} = ui.prompt({quote}\n{fixture_value}\n{quote});",
+                f"{quote}\n+redacted\n+{quote}",
+            ),
+            (
+                "runtime.cpp",
+                f'auto {key} = ui.prompt(R"({fixture_value})");',
+                'R"(redacted)"',
+            ),
+        )
+        for rel, source, expected in cases:
+            with self.subTest(rel=rel):
+                added_source = "+" + source.replace("\n", "\n+")
+                line_count = source.count("\n") + 1
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    f"@@ -0,0 +1,{line_count} @@\n"
+                    f"{added_source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn(expected, redacted_patch)
+
+    def test_review_patch_preserves_safe_credential_lookup_arguments(self) -> None:
+        key = "password"
+        source = f'{key} = headers.get("Authorization")'
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.ts"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_review_patch_redacts_noninterpolating_reference_literals(
+        self,
+    ) -> None:
+        key = "password"
+        literal = "${VERY_LONG_" + "PASSWORD_ENVIRONMENT_VARIABLE}"
+        for rel in ("Runtime.java", "runtime.cpp"):
+            with self.subTest(rel=rel):
+                source = f'{key} = decode("{literal}")'
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(literal, redacted_patch)
+                self.assertIn('decode("redacted")', redacted_patch)
+
+    def test_review_patch_allows_template_continuing_beyond_hunk(self) -> None:
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            "+const text = `value ${name}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertIn("`value ${name}", redacted_patch)
+
+    def test_review_patch_redacts_known_secret_in_incomplete_template_tail(
+        self,
+    ) -> None:
+        fixture_value = "ProdSecret123"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -1 +1 @@\n"
+            + "-pass"
+            + f'word = "{fixture_value}"\n'
+            + f"+const text = `prefix {fixture_value}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn("+const text = `prefix redacted", redacted_patch)
+
+    def test_review_patch_allows_inner_string_continuing_beyond_hunk(self) -> None:
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            "+const text = `value ${\"continued\\\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertIn('`value ${"continued\\', redacted_patch)
+
+    def test_review_patch_redacts_known_secret_in_incomplete_inner_string(
+        self,
+    ) -> None:
+        fixture_value = "ProdSecret123"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -1 +1 @@\n"
+            f'-password = "{fixture_value}"\n'
+            f'+const text = `prefix ${{"{fixture_value}\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('${"redacted', redacted_patch)
+
+    def test_review_patch_handles_javascript_template_comment_terminators(
+        self,
+    ) -> None:
+        fixture_value = "Abc1234"
+        for terminator in ("\r", "\u2028", "\u2029"):
+            with self.subTest(terminator=repr(terminator)):
+                patch = (
+                    "diff --git a/runtime.ts b/runtime.ts\n"
+                    "--- a/runtime.ts\n"
+                    "+++ b/runtime.ts\n"
+                    "@@ -0,0 +1 @@\n"
+                    + "+pass"
+                    + f"word = decode(`${{value//{fixture_value}{terminator}}}suffix`);\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.ts"],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn(
+                    f"//redacted{terminator}}}suffix",
+                    redacted_patch,
+                )
+
+    def test_review_patch_handles_unicode_terminator_in_javascript_call_comment(
+        self,
+    ) -> None:
+        fixture_value = "Abc1234"
+        terminator = "\u2028"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = runCommand(value, // note{terminator}"{fixture_value}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn(f'// note{terminator}"redacted"', redacted_patch)
+
+    def test_review_patch_redacts_combined_short_template_literals(self) -> None:
+        first = "Abc123"
+        second = "Def456"
+        interpolations = '${"' + first + '"}${"' + second + '"}'
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f"word = decode(`{interpolations}`);\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(first, redacted_patch)
+        self.assertNotIn(second, redacted_patch)
+        self.assertIn("decode(`${\"redacted-a\"}${\"redacted-b\"}`)", redacted_patch)
+
+    def test_review_patch_aggregates_template_literals_across_comments(
+        self,
+    ) -> None:
+        key = "password"
+        first = "Abc" + "123"
+        second = "Def" + "456"
+        expressions = (
+            f'${{"{first}" /* note */ + "{second}"}}',
+            f'${{"{first}" // note\n + "{second}"}}',
+        )
+        for expression in expressions:
+            with self.subTest(expression=expression):
+                source = f"{key} = decode(`{expression}`);"
+                lines = source.splitlines()
+                patch = (
+                    "diff --git a/runtime.ts b/runtime.ts\n"
+                    "--- a/runtime.ts\n"
+                    "+++ b/runtime.ts\n"
+                    f"@@ -0,0 +1,{len(lines)} @@\n"
+                    + "".join(f"+{line}\n" for line in lines)
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.ts"],
+                    patch,
+                )
+
+                self.assertNotIn(first, redacted_patch)
+                self.assertNotIn(second, redacted_patch)
+                self.assertIn("note", redacted_patch)
+
+    def test_review_patch_redacts_combined_short_numeric_template_literals(self) -> None:
+        first = "1234"
+        second = "5678"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f"word = decode(`${{{first}}}${{{second}}}`);\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(first, redacted_patch)
+        self.assertNotIn(second, redacted_patch)
+        self.assertIn("decode(`${redacted}${redacted}`)", redacted_patch)
+
+    def test_review_patch_redacts_literals_inside_call_comments(self) -> None:
+        fixture_value = "ProdSecret123"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = decode(/* "{fixture_value}" */ value);\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('decode(/* "redacted" */ value)', redacted_patch)
+
+    def test_review_patch_allows_block_comment_continuing_beyond_hunk(self) -> None:
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            "+run(value /* comment continues beyond available context\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertIn("comment continues beyond available context", redacted_patch)
+
+    def test_review_patch_redacts_distinct_literals_inside_public_call_comments(
+        self,
+    ) -> None:
+        first = "Abc1234"
+        second = "Def5678"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1,2 @@\n"
+            + f'+password = prompt(/* "{first}" */);\n'
+            + "+to"
+            + f'ken = prompt(/* "{second}" */);\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(first, redacted_patch)
+        self.assertNotIn(second, redacted_patch)
+        self.assertIn('prompt(/* "redacted-a" */)', redacted_patch)
+        self.assertIn('prompt(/* "redacted-b" */)', redacted_patch)
+
+    def test_review_patch_scans_after_python_floor_division(self) -> None:
+        fixture_value = "ProdSecret123"
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = decode(100 // 25, "{fixture_value}")\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('decode(100 // 25, "redacted")', redacted_patch)
+
+    def test_review_patch_preserves_identifier_after_python_floor_division(self) -> None:
+        identifier = "ProdSecret123"
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f"word = decode(total // {identifier})\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertIn(identifier, redacted_patch)
+
+    def test_review_patch_redacts_secret_after_python_assignment_floor_division(
+        self,
+    ) -> None:
+        fixture_value = "Prod" + "Secret123"
+        key = "pass" + "word"
+        source = f'{key} = seed // divisor + decode("{fixture_value}")'
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('// divisor + decode("redacted")', redacted_patch)
+
+    def test_review_patch_bounds_python_floor_division_at_semicolon(self) -> None:
+        fixture_value = "Prod" + "Secret123"
+        key = "pass" + "word"
+        source = f'{key} = total // 2; log("{fixture_value}")'
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.py"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_review_patch_redacts_python_floor_division_integer_secrets(
+        self,
+    ) -> None:
+        fixture_value = "12345678"
+        cases = (
+            f"password = primary // {fixture_value}",
+            f"password = decode(total // {fixture_value})",
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                patch = (
+                    "diff --git a/runtime.py b/runtime.py\n"
+                    "--- a/runtime.py\n"
+                    "+++ b/runtime.py\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.py"],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn("redacted", redacted_patch)
+
+    def test_review_patch_redacts_python_call_floor_division_suffix(self) -> None:
+        fixture_value = "Prod" + "Secret123"
+        source = f'password = get_value() // divisor + "{fixture_value}"'
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn(' + "redacted"', redacted_patch)
+
+    def test_review_patch_redacts_fallback_after_javascript_private_field(
+        self,
+    ) -> None:
+        fixture_value = "Prod" + "Secret123"
+        key = "pass" + "word"
+        source = f'{key} = this.#primary || "{fixture_value}";'
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('this.#primary || "redacted"', redacted_patch)
+
+    def test_review_patch_preserves_slash_comment_delimiters(self) -> None:
+        fixture_value = "Prod123"
+        for path in ("runtime.cc", "runtime.scala"):
+            with self.subTest(path=path):
+                patch = (
+                    f"diff --git a/{path} b/{path}\n"
+                    + f"--- a/{path}\n"
+                    + f"+++ b/{path}\n"
+                    + "@@ -0,0 +1,2 @@\n"
+                    + "+pass"
+                    + "word = runCommand(value, // apparent close )\n"
+                    + f'+  "{fixture_value}");\n'
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [path],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn('// apparent close )\n+  "redacted"', redacted_patch)
+
+    def test_review_patch_keeps_unicode_separator_inside_java_comment(self) -> None:
+        fixture_value = "ProdSecret123"
+        separator = "\u2028"
+        patch = (
+            "diff --git a/runtime.java b/runtime.java\n"
+            "--- a/runtime.java\n"
+            "+++ b/runtime.java\n"
+            "@@ -0,0 +1,2 @@\n"
+            + "+pass"
+            + f"word = runCommand(value, // apparent close {separator})\n"
+            + f'+  "{fixture_value}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.java"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn(
+            f"// apparent close {separator})\n+  \"redacted\"",
+            redacted_patch,
+        )
+
+    def test_review_patch_skips_regex_delimiters_in_ruby_and_swift(self) -> None:
+        fixture_value = "Prod123"
+        for path in ("runtime.rb", "runtime.swift"):
+            with self.subTest(path=path):
+                patch = (
+                    f"diff --git a/{path} b/{path}\n"
+                    + f"--- a/{path}\n"
+                    + f"+++ b/{path}\n"
+                    + "@@ -0,0 +1 @@\n"
+                    + "+pass"
+                    + f'word = runCommand(/[)]/, "{fixture_value}")\n'
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [path],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn('runCommand(/[)]/, "redacted")', redacted_patch)
+
+    def test_review_patch_splits_ruby_regex_and_call_arguments_independently(
+        self,
+    ) -> None:
+        fixture_value = "Abc123,Def456"
+        patch = (
+            "diff --git a/runtime.rb b/runtime.rb\n"
+            "--- a/runtime.rb\n"
+            "+++ b/runtime.rb\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = prompt(/"/, "{fixture_value}")\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.rb"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('prompt(/"/, "redacted")', redacted_patch)
+
+    def test_review_patch_preserves_regex_parsing_for_unclassified_language(
+        self,
+    ) -> None:
+        fixture_value = "Abc123,Def456"
+        patch = (
+            "diff --git a/runtime.groovy b/runtime.groovy\n"
+            "--- a/runtime.groovy\n"
+            "+++ b/runtime.groovy\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = prompt(/[)]/, "{fixture_value}")\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.groovy"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('prompt(/[)]/, "redacted")', redacted_patch)
+
+    def test_review_patch_redacts_groovy_slashy_credentials(self) -> None:
+        for literal, expected in (
+            ("/ProdSecret123/", "/redacted/"),
+            ("$/ProdSecret123/$", "$/redacted/$"),
+        ):
+            with self.subTest(literal=literal):
+                patch = (
+                    "diff --git a/runtime.groovy b/runtime.groovy\n"
+                    "--- a/runtime.groovy\n"
+                    "+++ b/runtime.groovy\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+password = decode({literal})\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.groovy"],
+                    patch,
+                )
+
+                self.assertNotIn("ProdSecret123", redacted_patch)
+                self.assertIn(expected, redacted_patch)
+
+    def test_review_patch_redacts_repeated_secret_in_groovy_slashy(self) -> None:
+        fixture_value = "Prod" + "Secret123"
+        for literal, expected in (
+            (f"/{fixture_value}/", "/redacted/"),
+            (f"$/{fixture_value}/$", "$/redacted/$"),
+        ):
+            with self.subTest(literal=literal):
+                patch = (
+                    "diff --git a/runtime.groovy b/runtime.groovy\n"
+                    "--- a/runtime.groovy\n"
+                    "+++ b/runtime.groovy\n"
+                    "@@ -1 +1 @@\n"
+                    f'-password = "{fixture_value}"\n'
+                    f"+def copy = {literal}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.groovy"],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn(f"+def copy = {expected}", redacted_patch)
+
+    def test_review_patch_redacts_multiline_groovy_slashy_credential(
+        self,
+    ) -> None:
+        patch = (
+            "diff --git a/runtime.groovy b/runtime.groovy\n"
+            "--- a/runtime.groovy\n"
+            "+++ b/runtime.groovy\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+pass"
+            "word = decode(/ProdSecret123\n"
+            "+more/)\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.groovy"],
+            patch,
+        )
+
+        self.assertNotIn("ProdSecret123", redacted_patch)
+        self.assertIn("decode(/redacted-a\n+redacted-b/)", redacted_patch)
+
+    def test_review_patch_balances_groovy_dollar_slashy_arguments(self) -> None:
+        fixture_value = "Abc123,Def456"
+        patch = (
+            "diff --git a/runtime.groovy b/runtime.groovy\n"
+            "--- a/runtime.groovy\n"
+            "+++ b/runtime.groovy\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = prompt($/[)]/$, "{fixture_value}")\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.groovy"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('prompt($/[)]/$, "redacted")', redacted_patch)
+
+    def test_review_patch_redacts_groovy_slashy_interpolation(self) -> None:
+        for literal in (
+            "/ProdSecret123${exfiltrate()}/",
+            "$/ProdSecret123${exfiltrate()}/$",
+        ):
+            with self.subTest(literal=literal):
+                patch = (
+                    "diff --git a/runtime.groovy b/runtime.groovy\n"
+                    "--- a/runtime.groovy\n"
+                    "+++ b/runtime.groovy\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+password = decode({literal})\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.groovy"],
+                    patch,
+                )
+
+                self.assertNotIn("ProdSecret123", redacted_patch)
+                self.assertIn("${exfiltrate()}", redacted_patch)
+
+    def test_review_patch_redacts_groovy_slashy_after_interpolation_division(
+        self,
+    ) -> None:
+        fixture_value = "Abcdefgh" + "1234"
+        for literal in (
+            f"/${{10 / 2}}{fixture_value}/",
+            f"$/${{10 / 2}}{fixture_value}/$",
+        ):
+            with self.subTest(literal=literal):
+                patch = (
+                    "diff --git a/runtime.groovy b/runtime.groovy\n"
+                    "--- a/runtime.groovy\n"
+                    "+++ b/runtime.groovy\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+password = decode({literal})\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.groovy"],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn("${10 / ", redacted_patch)
+
+    def test_review_patch_preserves_groovy_slashy_escaped_parenthesis(
+        self,
+    ) -> None:
+        source = r"def pattern = /\(/"
+        patch = (
+            "diff --git a/runtime.groovy b/runtime.groovy\n"
+            "--- a/runtime.groovy\n"
+            "+++ b/runtime.groovy\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.groovy"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_review_patch_preserves_benign_groovy_slashy_interpolation(
+        self,
+    ) -> None:
+        source = "def greeting = /hello $name/"
+        patch = (
+            "diff --git a/runtime.groovy b/runtime.groovy\n"
+            "--- a/runtime.groovy\n"
+            "+++ b/runtime.groovy\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.groovy"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_review_patch_preserves_unrelated_groovy_slashy_interpolation(
+        self,
+    ) -> None:
+        fixture_value = "Prod" + "Secret123"
+        key = "pass" + "word"
+        source = (
+            f'{key} = "{fixture_value}"\n'
+            "def greeting = /hello $name/"
+        )
+        patch = (
+            "diff --git a/runtime.groovy b/runtime.groovy\n"
+            "--- a/runtime.groovy\n"
+            "+++ b/runtime.groovy\n"
+            "@@ -0,0 +1,2 @@\n"
+            + "".join(f"+{line}\n" for line in source.splitlines())
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.groovy"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn("def greeting = /hello $name/", redacted_patch)
+
+    def test_review_patch_redacts_groovy_slashy_after_double_backslash(self) -> None:
+        patch = (
+            "diff --git a/runtime.groovy b/runtime.groovy\n"
+            "--- a/runtime.groovy\n"
+            "+++ b/runtime.groovy\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + 'word = decode(/prefix\\\\/ProdSecret123/)\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.groovy"],
+            patch,
+        )
+
+        self.assertNotIn("ProdSecret123", redacted_patch)
+        self.assertIn("decode(/redacted/)", redacted_patch)
+
+    def test_review_patch_preserves_escaped_dollar_slashy_value(self) -> None:
+        source = "def home = $/$$HOME/$"
+        patch = (
+            "diff --git a/runtime.groovy b/runtime.groovy\n"
+            "--- a/runtime.groovy\n"
+            "+++ b/runtime.groovy\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.groovy"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_review_patch_preserves_regex_parsing_for_php_mixed_content(self) -> None:
+        fixture_value = "ProdSecret123"
+        patch = (
+            "diff --git a/runtime.php b/runtime.php\n"
+            "--- a/runtime.php\n"
+            "+++ b/runtime.php\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = runCommand(/[)]/, "{fixture_value}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.php"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('runCommand(/[)]/, "redacted")', redacted_patch)
+
+    def test_review_patch_redacts_python_triple_quoted_call_literal(self) -> None:
+        fixture_value = "AlphaSecret123LongEnough999"
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            + "+pass"
+            + f'word = decode("""{fixture_value}\n'
+            + '+more""")\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('decode("""redacted-a\n+redacted-b""")', redacted_patch)
+
+    def test_review_patch_redacts_every_python_triple_quoted_literal_line(self) -> None:
+        alphabetic_fragment = "SuperSecretAlphabeticFragment"
+        numeric_fragment = "version123"
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            + "+pass"
+            + f'word = decode("""{alphabetic_fragment}\n'
+            + f'+{numeric_fragment}""")\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertNotIn(alphabetic_fragment, redacted_patch)
+        self.assertNotIn(numeric_fragment, redacted_patch)
+        self.assertIn('decode("""redacted-a\n+redacted-b""")', redacted_patch)
+
+    def test_review_patch_preserves_python_fstring_expression(self) -> None:
+        fixture_value = "Abc1234"
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            + "+pass"
+            + f'word = decode(f"""{fixture_value}\n'
+            + '+{exfiltrate()}""")\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('f"""redacted\n+{exfiltrate()}"""', redacted_patch)
+
+    def test_review_patch_preserves_whitespace_only_multiline_literal_line(
+        self,
+    ) -> None:
+        first = "Abc1234"
+        second = "Def5678"
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,3 @@\n"
+            + "+pass"
+            + f'word = decode("""{first}\n'
+            + "+   \n"
+            + f'+{second}""")\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertNotIn(first, redacted_patch)
+        self.assertNotIn(second, redacted_patch)
+        self.assertIn('"""redacted-a\n+   \n+redacted-b"""', redacted_patch)
+
+    def test_review_patch_rejects_source_matching_multiline_fragment(self) -> None:
+        source_identifier = "SharedIdentifier"
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,3 @@\n"
+            + "+pass"
+            + 'word = decode("""Alpha123\n'
+            + f'+{source_identifier}""")\n'
+            + f"+{source_identifier} = value\n"
+        )
+
+        with self.assertRaisesRegex(SystemExit, "known secret-like value"):
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.py"],
+                patch,
+            )
+
+    def test_review_patch_redacts_c_family_raw_multiline_call_literal(self) -> None:
+        fixture_value = "AlphaSecret123LongEnough999"
+        patch = (
+            "diff --git a/runtime.cc b/runtime.cc\n"
+            "--- a/runtime.cc\n"
+            "+++ b/runtime.cc\n"
+            "@@ -0,0 +1,2 @@\n"
+            + "+pass"
+            + f'word = decode(R"tag({fixture_value}\n'
+            + '+more)tag");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cc"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('decode(R"tag(redacted-a\n+redacted-b)tag")', redacted_patch)
+
+    def test_review_patch_redacts_adjacent_prefixed_c_family_literals(self) -> None:
+        first = "".join(("Abc", "123"))
+        second = "".join(("Def", "456"))
+        literals = (
+            f'u8"{first}" u8"{second}"',
+            f'u8R"tag({first})tag" u8R"({second})"',
+        )
+        for literal in literals:
+            with self.subTest(literal=literal):
+                patch = (
+                    "diff --git a/runtime.cpp b/runtime.cpp\n"
+                    "--- a/runtime.cpp\n"
+                    "+++ b/runtime.cpp\n"
+                    "@@ -0,0 +1 @@\n"
+                    "+pass"
+                    + f"word = decode({literal});\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.cpp"],
+                    patch,
+                )
+
+                self.assertNotIn(first, redacted_patch)
+                self.assertNotIn(second, redacted_patch)
+
+    def test_review_patch_allows_partial_benign_c_family_raw_hunks(self) -> None:
+        sources = (
+            'auto payload = R"tag(\nordinary text',
+            'ordinary text\n)tag";',
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                lines = source.splitlines()
+                patch = (
+                    "diff --git a/runtime.cpp b/runtime.cpp\n"
+                    "--- a/runtime.cpp\n"
+                    "+++ b/runtime.cpp\n"
+                    f"@@ -0,0 +1,{len(lines)} @@\n"
+                    + "".join(f"+{line}\n" for line in lines)
+                )
+
+                self.assertEqual(
+                    self.helper["validate_review_patch"](
+                        "local unstaged diff",
+                        ["runtime.cpp"],
+                        patch,
+                    ),
+                    patch,
+                )
+
+    def test_review_patch_allows_partial_benign_raw_secret_calls(self) -> None:
+        key = "pass" + "word"
+        cases = (
+            ("runtime.cs", f'{key} = decode("""\nordinary'),
+            ("runtime.cpp", f'{key} = decode(R"tag(\nordinary'),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                lines = source.splitlines()
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    f"@@ -0,0 +1,{len(lines)} @@\n"
+                    + "".join(f"+{line}\n" for line in lines)
+                )
+
+                self.assertEqual(
+                    self.helper["validate_review_patch"](
+                        "local unstaged diff",
+                        [rel],
+                        patch,
+                    ),
+                    patch,
+                )
+
+    def test_review_patch_scans_arguments_before_partial_raw_literal(self) -> None:
+        fixture_value = "Abc123Def456"
+        cases = (
+            ("runtime.cs", f'password = decode("{fixture_value}", """ok'),
+            ("runtime.cpp", f'password = decode("{fixture_value}", R"tag(ok'),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn('decode("redacted", ', redacted_patch)
+
+    def test_review_patch_rejects_partial_alphabetic_raw_secret_calls(
+        self,
+    ) -> None:
+        key = "pass" + "word"
+        for fixture_value in (
+            "abcdefghijklmnop",
+            "correct horse battery staple",
+        ):
+            cases = (
+                ("runtime.cs", f'{key} = decode("""{fixture_value}'),
+                ("runtime.cpp", f'{key} = decode(R"tag({fixture_value}'),
+            )
+            for rel, source in cases:
+                with self.subTest(rel=rel, fixture_value=fixture_value):
+                    patch = (
+                        f"diff --git a/{rel} b/{rel}\n"
+                        f"--- a/{rel}\n"
+                        f"+++ b/{rel}\n"
+                        "@@ -0,0 +1 @@\n"
+                        f"+{source}\n"
+                    )
+
+                    with self.assertRaisesRegex(
+                        SystemExit,
+                        "secret-like content|unterminated.*raw string",
+                    ):
+                        self.helper["validate_review_patch"](
+                            "local unstaged diff",
+                            [rel],
+                            patch,
+                        )
+
+    def test_review_patch_handles_variable_length_csharp_raw_string(self) -> None:
+        fixture_value = "ProdSecret123"
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = runCommand(""""payload"""", "{fixture_value}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cs"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('runCommand(""""payload"""", "redacted")', redacted_patch)
+
+    def test_review_patch_redacts_csharp_repeated_separator_integer(self) -> None:
+        fixture_value = "12__345__678"
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = decode($"{{{fixture_value}}}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cs"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('decode($"{redacted}")', redacted_patch)
+
+    def test_csharp_integer_syntax_accepts_repeated_separators(self) -> None:
+        syntax = self.helper["integer_literal_syntax"]
+
+        for literal in ("12__345__678", "0B__111", "0x__abc"):
+            with self.subTest(literal=literal):
+                self.assertTrue(syntax(literal, dialect="csharp"))
+        for literal in ("12__", "0B111__", "0xabc__"):
+            with self.subTest(literal=literal):
+                self.assertFalse(syntax(literal, dialect="csharp"))
+
+    def test_scala_integer_syntax_accepts_long_and_repeated_separators(
+        self,
+    ) -> None:
+        syntax = self.helper["integer_literal_syntax"]
+
+        for literal in ("12__345__678L", "0B__111l", "0x__abcL"):
+            with self.subTest(literal=literal):
+                self.assertTrue(syntax(literal, dialect="scala"))
+        for literal in ("12__", "123u", "0o777", "0B111__L", "0xabc__L"):
+            with self.subTest(literal=literal):
+                self.assertFalse(syntax(literal, dialect="scala"))
+
+    def test_review_patch_redacts_scala_long_interpolation(self) -> None:
+        fixture_value = "12__345__678L"
+        source = f'password = decode(s"${{{fixture_value}}}")'
+        patch = (
+            "diff --git a/runtime.scala b/runtime.scala\n"
+            "--- a/runtime.scala\n"
+            "+++ b/runtime.scala\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.scala"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('decode(s"${redacted}")', redacted_patch)
+
+    def test_review_patch_scans_scala_hash_operator_suffix(self) -> None:
+        fixture_value = "Horse7battery"
+        patch = (
+            "diff --git a/runtime.scala b/runtime.scala\n"
+            "--- a/runtime.scala\n"
+            "+++ b/runtime.scala\n"
+            "@@ -0,0 +1 @@\n"
+            f'+password = credentials.value # "{fixture_value}"\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.scala"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('# "redacted"', redacted_patch)
+
+    def test_c_family_preprocessor_string_keeps_string_context(self) -> None:
+        text = '#define TOKEN "Horse7battery"'
+        value_start = text.index("Horse7battery")
+
+        contexts = self.helper["string_contexts_at"](
+            text,
+            {value_start},
+            javascript_dialect="c-family",
+        )
+
+        self.assertIsNotNone(contexts[value_start])
+
+    def test_review_patch_redacts_csharp_integer_beside_range_operator(
+        self,
+    ) -> None:
+        fixture_value = "12345678"
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = decode($"{{..{fixture_value}}}:{{{fixture_value}..}}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cs"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn("{..redacted-a}", redacted_patch)
+        self.assertIn("{redacted-a..}", redacted_patch)
+
+    def test_csharp_integer_scan_excludes_decimal_points(self) -> None:
+        text = "0.12345678 12345678.0"
+
+        spans = self.helper["integer_literal_spans"](
+            text,
+            0,
+            len(text),
+            dialect="csharp",
+        )
+
+        self.assertEqual(spans, [])
+
+    def test_csharp_raw_literal_closes_at_end_of_quote_run(self) -> None:
+        text = '"""safe"""", "ProdSecret123"'
+
+        raw = self.helper["csharp_raw_literal_span"](
+            text,
+            0,
+            len(text),
+        )
+        spans, _ = self.helper["quoted_literal_value_spans"](
+            text,
+            0,
+            len(text),
+            javascript_dialect="csharp",
+            collect_all_literals=True,
+        )
+
+        self.assertIsNotNone(raw)
+        assert raw is not None
+        self.assertEqual(text[raw[0] : raw[1]], 'safe"')
+        self.assertEqual(text[raw[2] :], ', "ProdSecret123"')
+        self.assertIn("ProdSecret123", [text[start:end] for start, end in spans])
+
+    def test_csharp_raw_context_consumes_exact_literal_boundary(self) -> None:
+        text = '"""safe""""; ProdSecret123()'
+        raw_value = text.index("safe")
+        call_target = text.index("ProdSecret123")
+
+        contexts = self.helper["string_contexts_at"](
+            text,
+            {raw_value, call_target},
+            javascript_dialect="csharp",
+        )
+
+        self.assertIsNotNone(contexts[raw_value])
+        self.assertIsNone(contexts[call_target])
+
+    def test_review_patch_splits_csharp_raw_public_call_argument(self) -> None:
+        fixture_value = "ProdSecret123,tail"
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = prompt(""""{fixture_value}"""");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cs"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('prompt(""""redacted"""")', redacted_patch)
+
+    def test_review_patch_preserves_csharp_raw_interpolation_expression(self) -> None:
+        fixture_value = "Abc1234"
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1,2 @@\n"
+            + "+pass"
+            + f'word = decode($""""{fixture_value}\n'
+            + '+{exfiltrate()}"""");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cs"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('$""""redacted\n+{exfiltrate()}""""', redacted_patch)
+
+    def test_review_patch_balances_nested_csharp_raw_interpolation_braces(self) -> None:
+        fixture_value = "Abc1234"
+        expression = "(new A { B = new B { X = 1 }}).Exfiltrate()"
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = decode($$""""{fixture_value} {{{{{expression}}}}}"""");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cs"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn(f'$$""""redacted{{{{{expression}}}}}""""', redacted_patch)
+
+    def test_review_patch_parses_verbatim_string_inside_csharp_raw_interpolation(
+        self,
+    ) -> None:
+        fixture_value = "Abc1234"
+        expression = r'Get(@"C:\")'
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = decode($"""{fixture_value}{{{expression}}}""");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cs"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn("C:\\", redacted_patch)
+        self.assertIn(f'$"""redacted{{{expression}}}"""', redacted_patch)
+
+    def test_review_patch_groups_excess_csharp_raw_braces_from_inside(self) -> None:
+        fixture_value = "ProdSecret123"
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = decode($$"""{{{{{{value:{fixture_value}}}}}}}""");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cs"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('$$"""{{{value:redacted}}}"""', redacted_patch)
+
+    def test_review_patch_preserves_python_template_string_source(self) -> None:
+        fixture_value = "Abc1234"
+        expression = "exfiltrate1234()"
+        for prefix in ("t", "tr", "rt"):
+            with self.subTest(prefix=prefix):
+                patch = (
+                    "diff --git a/runtime.py b/runtime.py\n"
+                    "--- a/runtime.py\n"
+                    "+++ b/runtime.py\n"
+                    "@@ -0,0 +1 @@\n"
+                    + "+pass"
+                    + f'word = decode({prefix}"{fixture_value}{{{expression}}}")\n'
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.py"],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn(f'{prefix}"redacted{{{expression}}}"', redacted_patch)
+
+    def test_review_patch_preserves_raw_fstring_field_after_backslash(self) -> None:
+        expression = 'Evil1234("arg")'
+        source = f'rf"\\{{{expression}}}"'
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f"word = decode({source})\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertIn(source, redacted_patch)
+
+    def test_review_patch_closes_raw_fstring_after_even_backslashes(self) -> None:
+        fixture_value = "Secret123"
+        expression = "exfiltrate()"
+        source = f'rf"{fixture_value}{{{expression}}}\\\\"'
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f"word = decode({source})\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn(f'rf"redacted{{{expression}}}\\\\"', redacted_patch)
+
+    def test_secret_detector_checks_csharp_raw_interpolation_source(self) -> None:
+        content = (
+            'pass'
+            + 'word = decode($$""""redacted {{Get("hardcodedcredential")}}"""")'
+        )
+
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                content,
+                javascript_dialect="csharp",
+            )
+        )
+
+    def test_secret_detector_allows_non_javascript_member_interpolation(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "python",
+                'pass' + 'word = decode(f"{credential_store.authentication_token}")',
+            ),
+            (
+                "csharp",
+                'pass' + 'word = decode($"{credentialStore.AuthenticationToken}")',
+            ),
+        )
+
+        for dialect, content in cases:
+            with self.subTest(dialect=dialect):
+                self.assertFalse(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect=dialect,
+                    )
+                )
+
+    def test_review_patch_preserves_non_javascript_member_interpolation(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "runtime.py",
+                'pass' + 'word = decode(f"{credential_store.authentication_token}")',
+            ),
+            (
+                "runtime.cs",
+                'pass' + 'word = decode($"{credentialStore.AuthenticationToken}");',
+            ),
+        )
+
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertIn(source, redacted_patch)
+
+    def test_review_patch_preserves_java_member_credential_reference(self) -> None:
+        key = "password"
+        source = f"{key} = credentialStore.authenticationToken;"
+        patch = (
+            "diff --git a/Runtime.java b/Runtime.java\n"
+            "--- a/Runtime.java\n"
+            "+++ b/Runtime.java\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["Runtime.java"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_review_patch_rejects_java_unicode_escapes(self) -> None:
+        key = "password"
+        quote_escape = "\\" + "u0022"
+        fixture_value = "Prod" + "Secret123"
+        source = (
+            f"{key} = {quote_escape}"
+            + fixture_value
+            + f"{quote_escape};"
+        )
+        patch = (
+            "diff --git a/Runtime.java b/Runtime.java\n"
+            "--- a/Runtime.java\n"
+            "+++ b/Runtime.java\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        with self.assertRaisesRegex(SystemExit, "secret-like content"):
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["Runtime.java"],
+                patch,
+            )
+
+    def test_java_unicode_translation_tracks_translated_backslashes(self) -> None:
+        escape = lambda digits: "\\" + "u" + digits
+        source = escape("005c") + "\\" + escape("006e")
+
+        self.assertEqual(
+            self.helper["java_unicode_escape_translation"](source),
+            "\\\\n",
+        )
+
+    def test_review_patch_rejects_java_escape_after_translated_backslash(
+        self,
+    ) -> None:
+        escape = lambda digits: "\\" + "u" + digits
+        fixture_value = "Prod" + "Secret123"
+        source = (
+            'password = "'
+            + fixture_value
+            + escape("005c")
+            + "\\"
+            + escape("0022")
+            + ";"
+        )
+        patch = (
+            "diff --git a/Runtime.java b/Runtime.java\n"
+            "--- a/Runtime.java\n"
+            "+++ b/Runtime.java\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        with self.assertRaisesRegex(SystemExit, "secret-like content"):
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["Runtime.java"],
+                patch,
+            )
+
+    def test_review_patch_preserves_harmless_java_unicode_escape(self) -> None:
+        escape = "\\" + "u00A9"
+        source = f'String copyright = "{escape}";'
+        patch = (
+            "diff --git a/Runtime.java b/Runtime.java\n"
+            "--- a/Runtime.java\n"
+            "+++ b/Runtime.java\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["Runtime.java"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_review_patch_preserves_kotlin_backtick_call_target(self) -> None:
+        fixture_value = "Prod" + "Secret123"
+        source = f'password = decode("${{obj.`{fixture_value}`()}}")'
+        patch = (
+            "diff --git a/Runtime.kt b/Runtime.kt\n"
+            "--- a/Runtime.kt\n"
+            "+++ b/Runtime.kt\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["Runtime.kt"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_review_patch_preserves_jvm_backtick_identifier_assignments(
+        self,
+    ) -> None:
+        fixture_value = "Prod" + "Secret123"
+        for rel in ("Runtime.kt", "Runtime.scala"):
+            with self.subTest(rel=rel):
+                source = f"password = `{fixture_value}`"
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                self.assertEqual(
+                    self.helper["validate_review_patch"](
+                        "local unstaged diff",
+                        [rel],
+                        patch,
+                    ),
+                    patch,
+                )
+
+    def test_kotlin_backtick_target_does_not_hide_nested_literal(self) -> None:
+        fixture_value = "Prod" + "Secret123"
+        source = f'password = decode("${{obj.`safe target`("{fixture_value}")}}")'
+
+        spans, _ = self.helper["quoted_literal_value_spans"](
+            source,
+            0,
+            len(source),
+            javascript_dialect="kotlin",
+        )
+
+        self.assertIn(fixture_value, {source[start:end] for start, end in spans})
+        self.assertNotIn("safe target", {source[start:end] for start, end in spans})
+
+    def test_review_patch_preserves_scala_backtick_call_argument(self) -> None:
+        fixture_value = "Prod" + "Secret123"
+        source = f"password = decode(`{fixture_value}`)"
+        patch = (
+            "diff --git a/Runtime.scala b/Runtime.scala\n"
+            "--- a/Runtime.scala\n"
+            "+++ b/Runtime.scala\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["Runtime.scala"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_review_patch_preserves_known_triple_interpolation_source(
+        self,
+    ) -> None:
+        def kotlin_triple_source(value: str, interpolation: str) -> str:
+            key = "pass" + "word"
+            return f'{key} = decode("""{value} {interpolation}""")'
+
+        interpolations = (
+            "${" + "".join(("exfil", "trate()")) + "}",
+            "$" + "凭据变量" + str(12345678),
+        )
+        for interpolation in interpolations:
+            with self.subTest(interpolation=interpolation):
+                source = kotlin_triple_source("ProdSecret123", interpolation)
+                lines = source.splitlines()
+                patch = (
+                    "diff --git a/runtime.kt b/runtime.kt\n"
+                    "--- a/runtime.kt\n"
+                    "+++ b/runtime.kt\n"
+                    f"@@ -0,0 +1,{len(lines)} @@\n"
+                    + "".join(f"+{line}\n" for line in lines)
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.kt"],
+                    patch,
+                )
+
+                self.assertNotIn("ProdSecret123", redacted_patch)
+                self.assertIn(interpolation, redacted_patch)
+
+    def test_review_patch_redacts_nested_kotlin_raw_string_literal(self) -> None:
+        key = "password"
+        quote = '"' * 3
+        fixture_value = "Prod" + "Secret123"
+        source = (
+            f"{key} = decode({quote}"
+            + "${id("
+            + quote
+            + fixture_value
+            + quote
+            + ")}"
+            + f"{quote})"
+        )
+        patch = (
+            "diff --git a/runtime.kt b/runtime.kt\n"
+            "--- a/runtime.kt\n"
+            "+++ b/runtime.kt\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.kt"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn("${id(", redacted_patch)
+
+    def test_review_patch_redacts_nested_groovy_triple_string_literal(self) -> None:
+        key = "pass" + "word"
+        quote = '"' * 3
+        fixture_value = "Prod" + "Secret123"
+        source = (
+            f"{key} = decode({quote}"
+            + "${id("
+            + quote
+            + fixture_value
+            + quote
+            + ")}"
+            + f"{quote})"
+        )
+        patch = (
+            "diff --git a/runtime.groovy b/runtime.groovy\n"
+            "--- a/runtime.groovy\n"
+            "+++ b/runtime.groovy\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.groovy"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn("${id(", redacted_patch)
+
+    def test_review_patch_ignores_triple_assignment_text_in_comments(self) -> None:
+        source = '// password = """'
+        for rel in ("runtime.kt", "runtime.groovy"):
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                self.assertEqual(
+                    self.helper["validate_review_patch"](
+                        "local unstaged diff",
+                        [rel],
+                        patch,
+                    ),
+                    patch,
+                )
+
+    def test_review_patch_preserves_reference_only_swift_scala_triples(
+        self,
+    ) -> None:
+        cases = (
+            ("runtime.swift", 'password = decode("""\\(value)""")'),
+            ("runtime.scala", 'password = decode(s"""$value""")'),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                self.assertEqual(
+                    self.helper["validate_review_patch"](
+                        "local unstaged diff",
+                        [rel],
+                        patch,
+                    ),
+                    patch,
+                )
+
+    def test_review_patch_preserves_swift_scala_triple_interpolation_source(
+        self,
+    ) -> None:
+        fixture_value = "Prod" + "Secret123"
+        cases = (
+            (
+                "runtime.swift",
+                f'password = decode("""{fixture_value} \\(value)""")',
+                "\\(value)",
+            ),
+            (
+                "runtime.scala",
+                f'password = decode(s"""{fixture_value} $value""")',
+                "$value",
+            ),
+        )
+        for rel, source, interpolation in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn(interpolation, redacted_patch)
+
+    def test_review_patch_preserves_swift_scala_ordinary_interpolation_source(
+        self,
+    ) -> None:
+        fixture_value = "Prod" + "Secret123"
+        cases = (
+            (
+                "runtime.swift",
+                f'password = decode("{fixture_value} \\(value)")',
+                "\\(value)",
+            ),
+            (
+                "runtime.swift",
+                f'password = decode(#"{fixture_value} \\#(value)"#)',
+                "\\#(value)",
+            ),
+            (
+                "runtime.scala",
+                f'password = decode(s"{fixture_value} $value")',
+                "$value",
+            ),
+        )
+        for rel, source, interpolation in cases:
+            with self.subTest(rel=rel, source=source):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn(interpolation, redacted_patch)
+
+    def test_review_patch_rejects_swift_scala_interpolation_source_collision(
+        self,
+    ) -> None:
+        fixture_value = "Evil" + "1234"
+        cases = (
+            ("runtime.swift", f'"""\\({fixture_value}())"""'),
+            ("runtime.scala", f's"""${{{fixture_value}()}}"""'),
+        )
+        for rel, interpolation in cases:
+            with self.subTest(rel=rel):
+                source = f'password = "{fixture_value}"\nlet copy = {interpolation}'
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1,2 @@\n"
+                    + "".join(f"+{line}\n" for line in source.splitlines())
+                )
+
+                with self.assertRaisesRegex(
+                    SystemExit,
+                    "known secret-like value",
+                ):
+                    self.helper["validate_review_patch"](
+                        "local unstaged diff",
+                        [rel],
+                        patch,
+                    )
+
+    def test_review_patch_rejects_swift_scala_ordinary_source_collision(
+        self,
+    ) -> None:
+        fixture_value = "Evil" + "1234"
+        cases = (
+            ("runtime.swift", f'"\\({fixture_value}())"'),
+            ("runtime.swift", f'#"\\#({fixture_value}())"#'),
+            ("runtime.scala", f's"${{{fixture_value}()}}"'),
+        )
+        for rel, interpolation in cases:
+            with self.subTest(rel=rel, interpolation=interpolation):
+                source = f'password = "{fixture_value}"\nlet copy = {interpolation}'
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1,2 @@\n"
+                    + "".join(f"+{line}\n" for line in source.splitlines())
+                )
+
+                with self.assertRaisesRegex(
+                    SystemExit,
+                    "known secret-like value",
+                ):
+                    self.helper["validate_review_patch"](
+                        "local unstaged diff",
+                        [rel],
+                        patch,
+                    )
+
+    def test_scala_triple_quote_closes_after_backslash(self) -> None:
+        marker = '"' * 3
+        source = "s" + marker + "value" + "\\" + marker + "; exfiltrate()"
+
+        span = self.helper["triple_quoted_literal_span"](
+            source,
+            1,
+            len(source),
+            interpolation_dialect="scala",
+        )
+
+        self.assertIsNotNone(span)
+        assert span is not None
+        self.assertEqual(span[2], source.index(";"))
+
+    def test_scala_interpolated_quote_escape_does_not_close_literal(self) -> None:
+        source = 'password = decode(s"safe$"text")'
+        patch = (
+            "diff --git a/runtime.scala b/runtime.scala\n"
+            "--- a/runtime.scala\n"
+            "+++ b/runtime.scala\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.scala"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_scala_triple_quote_closes_at_end_of_quote_run(self) -> None:
+        marker = '"' * 3
+        source = "s" + marker + "value" + '"' * 4
+
+        span = self.helper["triple_quoted_literal_span"](
+            source,
+            1,
+            len(source),
+            interpolation_dialect="scala",
+        )
+
+        self.assertEqual(span, (4, len(source) - 3, len(source)))
+
+    def test_swift_scala_triple_string_contexts_exclude_interpolation_source(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "swift",
+                '"""literal \\(credentialCall("nested value"))"""',
+            ),
+            (
+                "scala",
+                's"""literal ${credentialCall("nested value")}"""',
+            ),
+        )
+        for dialect, source in cases:
+            with self.subTest(dialect=dialect):
+                positions = {
+                    source.index("literal"),
+                    source.index("credentialCall"),
+                    source.index("nested value"),
+                }
+                contexts = self.helper["string_contexts_at"](
+                    source,
+                    positions,
+                    javascript_dialect=dialect,
+                )
+
+                self.assertIsNotNone(contexts[source.index("literal")])
+                self.assertIsNone(contexts[source.index("credentialCall")])
+                self.assertIsNotNone(contexts[source.index("nested value")])
+
+    def test_swift_scala_ordinary_contexts_exclude_interpolation_source(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "swift",
+                '#"literal \\#(credentialCall("nested value"))"#',
+            ),
+            (
+                "scala",
+                's"literal ${credentialCall("nested value")}"',
+            ),
+        )
+        for dialect, source in cases:
+            with self.subTest(dialect=dialect):
+                positions = {
+                    source.index("literal"),
+                    source.index("credentialCall"),
+                    source.index("nested value"),
+                }
+                contexts = self.helper["string_contexts_at"](
+                    source,
+                    positions,
+                    javascript_dialect=dialect,
+                )
+
+                self.assertIsNotNone(contexts[source.index("literal")])
+                self.assertIsNone(contexts[source.index("credentialCall")])
+                self.assertIsNotNone(contexts[source.index("nested value")])
+
+    def test_review_patch_redacts_standalone_comment_credential(self) -> None:
+        fixture_value = "Prod" + "Secret123"
+        key = "pass" + "word"
+        source = f'// {key} = "{fixture_value}"'
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn(f'// {key} = "redacted"', redacted_patch)
+
+    def test_review_patch_redacts_assignment_embedded_in_literal(self) -> None:
+        fixture_value = "CorrectHorse7" + "Battery"
+        source = f'''const cmd = 'password="{fixture_value}"';'''
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('password="redacted"', redacted_patch)
+
+    def test_review_patch_redacts_complex_assignment_embedded_in_literal(
+        self,
+    ) -> None:
+        fixture_value = "CorrectHorse7" + "Battery"
+        for value in (
+            f'decode("{fixture_value}")',
+            f'primary || "{fixture_value}"',
+        ):
+            with self.subTest(value=value):
+                source = f"const cmd = 'password = {value}';"
+                patch = (
+                    "diff --git a/runtime.ts b/runtime.ts\n"
+                    "--- a/runtime.ts\n"
+                    "+++ b/runtime.ts\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.ts"],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn("redacted", redacted_patch)
+
+    def test_review_patch_rejects_secret_collision_in_triple_source(self) -> None:
+        fixture_value = "EvilSecret123"
+        source = "pass" + f'word = "{fixture_value}"\n"""${{{fixture_value}()}}"""'
+        patch = (
+            "diff --git a/runtime.kt b/runtime.kt\n"
+            "--- a/runtime.kt\n"
+            "+++ b/runtime.kt\n"
+            "@@ -0,0 +1,2 @@\n"
+            + "".join(f"+{line}\n" for line in source.splitlines())
+        )
+
+        with self.assertRaisesRegex(SystemExit, "known secret-like value"):
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.kt"],
+                patch,
+            )
+
+    def test_review_patch_redacts_python_field_after_backslash(self) -> None:
+        fixture_value = "ProdSecret123"
+        source = f'password = decode(f"\\{{get(\"{fixture_value}\")}}")'
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('f"\\{get("redacted")}"', redacted_patch)
+
+    def test_review_patch_redacts_grouped_short_numeric_fields(self) -> None:
+        for rel, literal in (
+            ("runtime.py", 'f"{1234}{5678}"'),
+            ("runtime.cs", '$"{1234}{5678}"'),
+        ):
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    + "+pass"
+                    + f"word = decode({literal})\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn("1234", redacted_patch)
+                self.assertNotIn("5678", redacted_patch)
+
+    def test_review_patch_redacts_concatenated_short_template_literals(self) -> None:
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + 'word = decode(`${"Abc123" + "Def456"}`)\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn("Abc123", redacted_patch)
+        self.assertNotIn("Def456", redacted_patch)
+
+    def test_review_patch_redacts_prefixed_nested_string_fragments(self) -> None:
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + 'word = decode(f\'{f"Abc123"}{f"Def456"}\')\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertNotIn("Abc123", redacted_patch)
+        self.assertNotIn("Def456", redacted_patch)
+
+    def test_review_patch_checks_placeholder_as_part_of_template_value(self) -> None:
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + 'word = decode(`redacted${"123456"}`)\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn("123456", redacted_patch)
+
+    def test_review_patch_redacts_kotlin_triple_prompt_argument(self) -> None:
+        fixture_value = 'Prod"Secret123,Abc456'
+        patch = (
+            "diff --git a/runtime.kt b/runtime.kt\n"
+            "--- a/runtime.kt\n"
+            "+++ b/runtime.kt\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = ui.prompt("""{fixture_value}""")\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.kt"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('ui.prompt("""redacted""")', redacted_patch)
+
+    def test_review_patch_rejects_incomplete_csharp_raw_string(self) -> None:
+        for prefix in ("", "$", "$$"):
+            with self.subTest(prefix=prefix):
+                patch = (
+                    "diff --git a/runtime.cs b/runtime.cs\n"
+                    "--- a/runtime.cs\n"
+                    "+++ b/runtime.cs\n"
+                    "@@ -0,0 +1,2 @@\n"
+                    + "+pass"
+                    + f'word = decode({prefix}"""\n'
+                    "+ProdSecret123\n"
+                )
+
+                with self.assertRaisesRegex(
+                    SystemExit,
+                    "unterminated C# raw string",
+                ):
+                    self.helper["validate_review_patch"](
+                        "local unstaged diff",
+                        ["runtime.cs"],
+                        patch,
+                    )
+
+    def test_review_patch_allows_partial_benign_csharp_raw_string_hunks(
+        self,
+    ) -> None:
+        quote = '"' * 3
+        sources = (
+            f"const payload = {quote}\nordinary text",
+            f"ordinary text\n{quote};",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                lines = source.splitlines()
+                patch = (
+                    "diff --git a/runtime.cs b/runtime.cs\n"
+                    "--- a/runtime.cs\n"
+                    "+++ b/runtime.cs\n"
+                    f"@@ -0,0 +1,{len(lines)} @@\n"
+                    + "".join(f"+{line}\n" for line in lines)
+                )
+
+                self.assertEqual(
+                    self.helper["validate_review_patch"](
+                        "local unstaged diff",
+                        ["runtime.cs"],
+                        patch,
+                    ),
+                    patch,
+                )
+
+    def test_review_patch_rejects_truncated_interpolated_csharp_raw_literal(
+        self,
+    ) -> None:
+        fixture_value = "ProdSecret123"
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            + f'+const payload = $"""{fixture_value}\n'
+        )
+
+        with self.assertRaisesRegex(
+            SystemExit,
+            "unterminated C# raw string",
+        ):
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.cs"],
+                patch,
+            )
+
+    def test_review_patch_rejects_truncated_structured_literals(self) -> None:
+        fixture_value = "a" * 19
+        for rel, source in (
+            (
+                "runtime.py",
+                "".join(("pass", f'word = decode("""{fixture_value}')),
+            ),
+            (
+                "runtime.cs",
+                "".join(("pass", f'word = decode($@"{fixture_value}')),
+            ),
+        ):
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                with self.assertRaisesRegex(
+                    SystemExit,
+                    "unterminated secret call",
+                ):
+                    self.helper["validate_review_patch"](
+                        "local unstaged diff",
+                        [rel],
+                        patch,
+                    )
+
+    def test_review_patch_rejects_multiline_truncated_call_tail(self) -> None:
+        fixture_value = "a" * 19
+        source_lines = (
+            "".join(("pass", "word = decode(")),
+            f'    """{fixture_value}',
+        )
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            + "".join(f"+{line}\n" for line in source_lines)
+        )
+
+        with self.assertRaisesRegex(
+            SystemExit,
+            "unterminated secret call",
+        ):
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.py"],
+                patch,
+            )
+
+    def test_review_patch_rejects_two_word_truncated_raw_secret_call(self) -> None:
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+password = decode(\"\"\"\n"
+            "+alphabet soup\n"
+        )
+
+        with self.assertRaisesRegex(
+            SystemExit,
+            "unterminated secret call",
+        ):
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.py"],
+                patch,
+            )
+
+    def test_review_patch_redacts_direct_structured_secret_assignments(
+        self,
+    ) -> None:
+        fixture_value = "Abc123" + "Def456"
+        cases = (
+            ("runtime.py", f'password = \"\"\"{fixture_value}\"\"\"'),
+            ("runtime.py", f'password = f\"{fixture_value}\"'),
+            ("runtime.cs", f'password = $\"\"\"{fixture_value}\"\"\";'),
+            ("runtime.cpp", f'password = R\"tag({fixture_value})tag\";'),
+            ("runtime.swift", f'password = #\"{fixture_value}\"#'),
+            ("runtime.scala", f'password = s\"{fixture_value}\"'),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn("redacted", redacted_patch)
+
+    def test_review_patch_applies_assignment_minimum_to_structured_literals(
+        self,
+    ) -> None:
+        fixture_value = "abcdefgh"
+        cases = (
+            ("runtime.py", f'password = b"{fixture_value}"'),
+            ("runtime.cs", f'password = $"{fixture_value}";'),
+            ("runtime.cs", f'password = """{fixture_value}""";'),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel, source=source):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn("redacted", redacted_patch)
+
+    def test_review_patch_redacts_after_swift_scala_nested_delimiters(
+        self,
+    ) -> None:
+        fixture_value = "Prod" + "Secret123"
+        cases = (
+            (
+                "runtime.swift",
+                f'password = decode(#"safe )" inside"#, "{fixture_value}")',
+            ),
+            (
+                "runtime.scala",
+                f'password = decode(s"${{format("safe )")}}", "{fixture_value}")',
+            ),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn("redacted", redacted_patch)
+
+    def test_review_patch_redacts_after_swift_extended_regex(self) -> None:
+        fixture_value = "Prod" + "Secret123"
+        source = f'password = decode(#/)/#, "{fixture_value}")'
+        patch = (
+            "diff --git a/runtime.swift b/runtime.swift\n"
+            "--- a/runtime.swift\n"
+            "+++ b/runtime.swift\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.swift"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('#/)/#, "redacted"', redacted_patch)
+
+    def test_review_patch_prioritizes_c_family_raw_delimiter(self) -> None:
+        fixture_value = "Abc" + "12345"
+        source = f'password = decode(R"""(safe"""{fixture_value})""");'
+        patch = (
+            "diff --git a/runtime.cpp b/runtime.cpp\n"
+            "--- a/runtime.cpp\n"
+            "+++ b/runtime.cpp\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cpp"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn("redacted", redacted_patch)
+
+    def test_review_patch_redacts_incomplete_direct_structured_assignments(
+        self,
+    ) -> None:
+        fixture_value = "alphabet soup"
+        cases = (
+            ("runtime.py", f'password = """{fixture_value}'),
+            ("runtime.cs", f'password = """{fixture_value}'),
+            ("runtime.cpp", f'password = R"tag({fixture_value}'),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn("redacted", redacted_patch)
+
+    def test_review_patch_closes_kotlin_raw_string_after_backslash(self) -> None:
+        patch = (
+            "diff --git a/runtime.kt b/runtime.kt\n"
+            "--- a/runtime.kt\n"
+            "+++ b/runtime.kt\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + 'word = decode("""ProdSecret123\\"""); exfiltrate()\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.kt"],
+            patch,
+        )
+
+        self.assertNotIn("ProdSecret123", redacted_patch)
+        self.assertIn("exfiltrate()", redacted_patch)
+
+    def test_review_patch_redacts_literals_inside_non_javascript_interpolations(
+        self,
+    ) -> None:
+        fixture_value = "Abc1234"
+        cases = (
+            (
+                "runtime.cs",
+                "pass"
+                + f'word = decode($$""""{{{{Get("{fixture_value}")}}}}"""")',
+            ),
+            (
+                "runtime.py",
+                "pass"
+                + f'word = decode(f"""{{get("{fixture_value}")}}""")',
+            ),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                expected = (
+                    'Get("redacted")'
+                    if rel.endswith(".cs")
+                    else 'get("redacted")'
+                )
+                self.assertIn(expected, redacted_patch)
+
+    def test_review_patch_aggregates_non_javascript_interpolation_fragments(
+        self,
+    ) -> None:
+        cases = (
+            ("runtime.cs", 'pass' + 'word = decode($"""Abc123{"Def456"}""");'),
+            ("runtime.py", 'pass' + 'word = decode(f"""Abc123{"Def456"}""")'),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn("Abc123", redacted_patch)
+                self.assertNotIn("Def456", redacted_patch)
+                self.assertIn('redacted-a{"redacted-b"}', redacted_patch)
+
+    def test_review_patch_aggregates_swift_interpolation_fragments(self) -> None:
+        cases = (
+            'password = decode("\\("Abc123")\\("Def456")")',
+            'password = decode(#"\\#("Abc123")\\#("Def456")"#)',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                patch = (
+                    "diff --git a/runtime.swift b/runtime.swift\n"
+                    "--- a/runtime.swift\n"
+                    "+++ b/runtime.swift\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.swift"],
+                    patch,
+                )
+
+                self.assertNotIn("Abc123", redacted_patch)
+                self.assertNotIn("Def456", redacted_patch)
+
+    def test_review_patch_preserves_calls_before_nested_multiline_literals(
+        self,
+    ) -> None:
+        fixture_value = "Abc1234"
+        cases = (
+            (
+                "runtime.cs",
+                'pass'
+                + f'word = decode($"""{fixture_value}'
+                + '{Evil1234("""nested""")}""");',
+            ),
+            (
+                "runtime.py",
+                'pass'
+                + f'word = decode(f"""{fixture_value}'
+                + '{Evil1234("""nested""")}""")',
+            ),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn('Evil1234("""nested""")', redacted_patch)
+
+    def test_review_patch_preserves_ordinary_interpolation_expressions(
+        self,
+    ) -> None:
+        fixture_value = "Abc1234"
+        cases = (
+            (
+                "runtime.py",
+                'pass' + f'word = decode(f"{fixture_value}{{exfiltrate()}}")',
+                'f"redacted{exfiltrate()}"',
+            ),
+            (
+                "runtime.cs",
+                'pass' + f'word = decode($"{fixture_value}{{exfiltrate()}}");',
+                '$"redacted{exfiltrate()}"',
+            ),
+        )
+        for rel, source, expected in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn(expected, redacted_patch)
+
+    def test_review_patch_preserves_direct_groovy_kotlin_interpolation(
+        self,
+    ) -> None:
+        fixture_value = "ProdSecret123"
+        for rel in ("runtime.groovy", "runtime.kt"):
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f'+password = "{fixture_value}${{runDangerousOperation()}}"\n'
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn(
+                    '"redacted${runDangerousOperation()}"',
+                    redacted_patch,
+                )
+
+    def test_review_patch_preserves_groovy_gstring_expression(self) -> None:
+        fixture_value = "ProdSecret123"
+        patch = (
+            "diff --git a/runtime.groovy b/runtime.groovy\n"
+            "--- a/runtime.groovy\n"
+            "+++ b/runtime.groovy\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = decode("{fixture_value}${{exfiltrate()}}")\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.groovy"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('"redacted${exfiltrate()}"', redacted_patch)
+
+    def test_review_patch_redacts_nested_dollar_interpolation_literal(self) -> None:
+        fixture_value = "ProdSecret123"
+        for rel in ("runtime.kt", "runtime.groovy"):
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    + "+pass"
+                    + f'word = decode("${{lookup("{fixture_value}")}}")\n'
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn('${lookup("redacted")}', redacted_patch)
+
+    def test_review_patch_balances_dollar_interpolation_call_arguments(self) -> None:
+        fixture_value = "ProdSecret123"
+        for rel in ("runtime.kt", "runtime.groovy"):
+            with self.subTest(rel=rel):
+                source = (
+                    'password = decode("${lookup(")")}", "'
+                    + fixture_value
+                    + '")'
+                )
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn('${lookup(")")}', redacted_patch)
+                self.assertIn(', "redacted")', redacted_patch)
+
+    def test_review_patch_redacts_dollar_interpolation_integer(self) -> None:
+        for rel in ("runtime.kt", "runtime.groovy"):
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    + "+pass"
+                    + 'word = decode("${12345678}")\n'
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn("12345678", redacted_patch)
+                self.assertIn("${redacted}", redacted_patch)
+
+    def test_review_patch_redacts_integer_before_escaped_member_access(
+        self,
+    ) -> None:
+        key = "password"
+        first = "1234"
+        second = "5678"
+        cases = (
+            ("runtime.kt", f"`toString`", "${redacted.`toString`()}"),
+            ("runtime.groovy", "'toString'", "${redacted.'toString'()}"),
+        )
+        for rel, member, expected in cases:
+            with self.subTest(rel=rel):
+                source = (
+                    f'{key} = decode("${{'
+                    + first
+                    + second
+                    + f".{member}()}}\")"
+                )
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(first + second, redacted_patch)
+                self.assertIn(expected, redacted_patch)
+
+    def test_review_patch_redacts_integer_range_interpolations(self) -> None:
+        key = "password"
+        number = "1234" + "5678"
+        for rel in ("runtime.kt", "runtime.groovy"):
+            with self.subTest(rel=rel):
+                source = f'{key} = decode("${{({number}..{number}).first}}")'
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(number, redacted_patch)
+
+    def test_review_patch_redacts_aggregated_dollar_interpolation_integers(
+        self,
+    ) -> None:
+        key = "password"
+        first = "12" + "34"
+        second = "56" + "78"
+        for rel in ("runtime.kt", "runtime.groovy"):
+            with self.subTest(rel=rel):
+                source = f'{key} = decode("${{{first}}}${{{second}}}")'
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn("1234", redacted_patch)
+                self.assertNotIn("5678", redacted_patch)
+                self.assertIn('${redacted}${redacted}', redacted_patch)
+
+    def test_review_patch_scans_groovy_single_quoted_dollars_as_literals(
+        self,
+    ) -> None:
+        fixture_value = "$ProdSecret123"
+        for marker in ("'", "'''"):
+            with self.subTest(marker=marker):
+                source = "pass" + f"word = runCommand({marker}{fixture_value}{marker})"
+                patch = (
+                    "diff --git a/runtime.groovy b/runtime.groovy\n"
+                    "--- a/runtime.groovy\n"
+                    "+++ b/runtime.groovy\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.groovy"],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn(f"runCommand({marker}redacted{marker})", redacted_patch)
+
+    def test_review_patch_preserves_benign_dollar_triple_strings(self) -> None:
+        cases = (
+            ("runtime.kt", 'val greeting = """hello $name"""'),
+            ("runtime.groovy", 'def greeting = """hello $name"""'),
+            ("runtime.kt", r'val regex = """\("""'),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel, source=source):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                self.assertEqual(
+                    self.helper["validate_review_patch"](
+                        "local unstaged diff",
+                        [rel],
+                        patch,
+                    ),
+                    patch,
+                )
+
+    def test_review_patch_preserves_java_text_block_placeholder(self) -> None:
+        quote = '"' * 3
+        patch = (
+            "diff --git a/Runtime.java b/Runtime.java\n"
+            "--- a/Runtime.java\n"
+            "+++ b/Runtime.java\n"
+            "@@ -0,0 +1,3 @@\n"
+            f"+String template = {quote}\n"
+            "+hello ${name}\n"
+            f"+{quote};\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["Runtime.java"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_review_patch_redacts_dollar_triple_string_literal_segments(
+        self,
+    ) -> None:
+        fixture_value = "ProdSecret123"
+        for rel in ("runtime.kt", "runtime.groovy"):
+            with self.subTest(rel=rel):
+                source = "pass" + f'word = """{fixture_value} $name"""'
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn('"""redacted$name"""', redacted_patch)
+
+    def test_review_patch_honors_kotlin_multi_dollar_interpolation(self) -> None:
+        key = "password"
+        fixture_value = "$Abc1234"
+        literal_source = f'{key} = decode($$"""{fixture_value}""")'
+        interpolation_source = (
+            f'{key} = decode($$"""'
+            + "$${credentialStore.authenticationToken}"
+            + '""")'
+        )
+        for source, expected_redaction in (
+            (literal_source, '$$"""redacted"""'),
+            (interpolation_source, None),
+        ):
+            with self.subTest(source=source):
+                patch = (
+                    "diff --git a/runtime.kt b/runtime.kt\n"
+                    "--- a/runtime.kt\n"
+                    "+++ b/runtime.kt\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.kt"],
+                    patch,
+                )
+
+                if expected_redaction is None:
+                    self.assertEqual(redacted_patch, patch)
+                else:
+                    self.assertNotIn(fixture_value, redacted_patch)
+                    self.assertIn(expected_redaction, redacted_patch)
+
+    def test_review_patch_redacts_direct_kotlin_multi_dollar_assignment(
+        self,
+    ) -> None:
+        fixture_value = "Abc123Def456"
+        source = f'password = $$"""{fixture_value}"""'
+        patch = (
+            "diff --git a/runtime.kt b/runtime.kt\n"
+            "--- a/runtime.kt\n"
+            "+++ b/runtime.kt\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.kt"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('password = $$"""redacted"""', redacted_patch)
+
+    def test_review_patch_uses_trailing_kotlin_multi_dollar_marker(self) -> None:
+        key = "password"
+        fixture_value = "Prod" + "Secret123"
+        interpolation = "$${" + "exfiltrate()" + "}"
+        source = (
+            f'{key} = decode($$"""{fixture_value} '
+            + "$"
+            + interpolation
+            + '""")'
+        )
+        patch = (
+            "diff --git a/runtime.kt b/runtime.kt\n"
+            "--- a/runtime.kt\n"
+            "+++ b/runtime.kt\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.kt"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn(interpolation, redacted_patch)
+
+    def test_review_patch_preserves_kotlin_raw_backslash_interpolation(
+        self,
+    ) -> None:
+        key = "password"
+        fixture_value = "Abc1234"
+        interpolation = "${exfiltrate()}"
+        source = f'{key} = decode("""{fixture_value}\\{interpolation}""")'
+        patch = (
+            "diff --git a/runtime.kt b/runtime.kt\n"
+            "--- a/runtime.kt\n"
+            "+++ b/runtime.kt\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.kt"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn(interpolation, redacted_patch)
+
+    def test_review_patch_preserves_dollar_member_credential_references(
+        self,
+    ) -> None:
+        key = "password"
+        for rel in ("runtime.kt", "runtime.groovy"):
+            with self.subTest(rel=rel):
+                source = (
+                    f'{key} = decode("'
+                    + "${credentialStore.authenticationToken}"
+                    + '")'
+                )
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                self.assertEqual(
+                    self.helper["validate_review_patch"](
+                        "local unstaged diff",
+                        [rel],
+                        patch,
+                    ),
+                    patch,
+                )
+
+    def test_review_patch_redacts_python_fallback_after_floor_division(
+        self,
+    ) -> None:
+        fixture_value = "ProdSecret123"
+        key = "password"
+        source = " ".join(
+            (
+                key,
+                "=",
+                "primary",
+                "/" * 2,
+                "divisor",
+                "or",
+                repr(fixture_value),
+            )
+        )
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn("or 'redacted'", redacted_patch)
+
+    def test_review_patch_rejects_excessive_dollar_interpolation_nesting(
+        self,
+    ) -> None:
+        expression = '"safe"'
+        for _ in range(66):
+            expression = '"${' + expression + '}"'
+
+        with self.assertRaisesRegex(
+            SystemExit,
+            "excessive interpolation nesting",
+        ):
+            self.helper["secret_literal_risk"](
+                expression,
+                javascript_dialect="kotlin",
+            )
+
+    def test_review_patch_preserves_benign_kotlin_interpolation(self) -> None:
+        source = 'val greeting = "hello $name"'
+        patch = (
+            "diff --git a/runtime.kt b/runtime.kt\n"
+            "--- a/runtime.kt\n"
+            "+++ b/runtime.kt\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.kt"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_review_patch_rejects_dollar_interpolation_source_collision(
+        self,
+    ) -> None:
+        fixture_value = "exfiltrate1234"
+        key = "pass" + "word"
+        for rel in ("runtime.kt", "runtime.groovy"):
+            with self.subTest(rel=rel):
+                source_lines = (
+                    f'{key} = "{fixture_value}"',
+                    'output = "${' + fixture_value + '()}"',
+                )
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1,2 @@\n"
+                    + "".join(f"+{line}\n" for line in source_lines)
+                )
+
+                with self.assertRaisesRegex(
+                    SystemExit,
+                    "known secret-like value",
+                ):
+                    self.helper["validate_review_patch"](
+                        "local unstaged diff",
+                        [rel],
+                        patch,
+                    )
+
+    def test_review_patch_rejects_secret_collision_in_interpolation_source(
+        self,
+    ) -> None:
+        fixture_value = "Abc1234"
+        cases = (
+            (
+                "runtime.ts",
+                'pass'
+                + f'word = decode(`{fixture_value}${{{fixture_value}()}}`);',
+            ),
+            (
+                "runtime.py",
+                'pass'
+                + f'word = decode(f"{fixture_value}{{{fixture_value}()}}")',
+            ),
+            (
+                "runtime.cs",
+                'pass'
+                + f'word = decode($"{fixture_value}{{{fixture_value}()}}");',
+            ),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                with self.assertRaisesRegex(SystemExit, "known secret-like value"):
+                    self.helper["validate_review_patch"](
+                        "local unstaged diff",
+                        [rel],
+                        patch,
+                    )
+
+    def test_review_patch_rejects_empty_literal_interpolation_source_collision(
+        self,
+    ) -> None:
+        fixture_value = "Evil1234"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1,2 @@\n"
+            + "+pass"
+            + f'word = "{fixture_value}";\n'
+            + f"+const out = `${{{fixture_value}()}}`;\n"
+        )
+
+        with self.assertRaisesRegex(SystemExit, "known secret-like value"):
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.ts"],
+                patch,
+            )
+
+    def test_review_patch_rejects_multiline_interpolation_source_collision(
+        self,
+    ) -> None:
+        fixture_value = "Evil1234"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1,3 @@\n"
+            + "+pass"
+            + f'word = "{fixture_value}";\n'
+            + f"+const out = `${{{fixture_value}(\n"
+            + "+  value)}`;\n"
+        )
+
+        with self.assertRaisesRegex(SystemExit, "known secret-like value"):
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.ts"],
+                patch,
+            )
+
+    def test_review_patch_retains_source_proof_before_incomplete_javascript(
+        self,
+    ) -> None:
+        fixture_value = "Evil1234"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1,4 @@\n"
+            + "+pass"
+            + f'word = "{fixture_value}";\n'
+            + f"+const out = `${{{fixture_value}(\n"
+            + "+  value)}`;\n"
+            + "+/* incomplete\n"
+        )
+
+        with self.assertRaisesRegex(SystemExit, "known secret-like value"):
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.ts"],
+                patch,
+            )
+
+    def test_review_patch_bounds_interpolation_nesting(self) -> None:
+        nested = '"Abc1234"'
+        for _ in range(70):
+            nested = f'f"{{{nested}}}"'
+
+        with self.assertRaisesRegex(SystemExit, "excessive interpolation nesting"):
+            self.helper["quoted_literal_value_spans"](
+                nested,
+                0,
+                len(nested),
+                javascript_dialect="python",
+            )
+
+    def test_review_patch_parses_nested_csharp_prompt_argument_commas(self) -> None:
+        fixture_value = "Alpha123,Beta456"
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = prompt($"{{Get("{fixture_value}")}}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cs"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('prompt($"{Get("redacted")}")', redacted_patch)
+
+    def test_review_patch_redacts_numeric_non_javascript_interpolations(
+        self,
+    ) -> None:
+        fixture_value = "12345678"
+        cases = (
+            ("runtime.py", f'pass' + f'word = decode(f"{{{fixture_value}}}")'),
+            ("runtime.cs", f'pass' + f'word = decode($"{{{fixture_value}}}");'),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn("{redacted}", redacted_patch)
+
+    def test_review_patch_redacts_floating_point_interpolation_credentials(
+        self,
+    ) -> None:
+        cases = (
+            ("runtime.py", 'pass' + 'word = decode(f"{0.12345678}")'),
+            ("runtime.py", 'pass' + 'word = decode(f"{12345678.0}")'),
+            ("runtime.py", 'pass' + 'word = decode(f"{.12345678}")'),
+            ("runtime.py", 'pass' + 'word = decode(f"{12345678.}")'),
+            ("runtime.py", 'pass' + 'word = decode(f"{12345678.e10}")'),
+            ("runtime.cs", 'pass' + 'word = decode($"{0.12345678}");'),
+            ("runtime.cs", 'pass' + 'word = decode($"{12345678.0}");'),
+            ("runtime.cs", 'pass' + 'word = decode($"{.12345678}");'),
+            ("runtime.cs", 'pass' + 'word = decode($"{12345678.}");'),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel, source=source):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(source, redacted_patch)
+                self.assertIn("{redacted}", redacted_patch)
+
+    def test_review_patch_preserves_python_floor_division_interpolation(
+        self,
+    ) -> None:
+        source = 'password = decode(f"{1234 // 5678}")'
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.py"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_review_patch_preserves_below_threshold_separator_integers(self) -> None:
+        fixture_value = "1_2_3_4_5_6_7"
+        cases = (
+            (
+                "runtime.ts",
+                'pass' + f'word = decode(`${{{fixture_value}}}`);',
+            ),
+            (
+                "runtime.py",
+                'pass' + f'word = decode(f"{{{fixture_value}}}")',
+            ),
+            (
+                "runtime.cs",
+                'pass' + f'word = decode($"{{{fixture_value}}}");',
+            ),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertIn(source, redacted_patch)
+
+    def test_review_patch_preserves_independent_interpolation_arithmetic(self) -> None:
+        cases = (
+            ("runtime.ts", 'pass' + 'word = decode(`${1234 + 5678}`);'),
+            ("runtime.py", 'pass' + 'word = decode(f"{1234 + 5678}")'),
+            ("runtime.cs", 'pass' + 'word = decode($"{1234 + 5678}");'),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertIn(source, redacted_patch)
+
+    def test_review_patch_preserves_formatted_interpolation_arithmetic(
+        self,
+    ) -> None:
+        cases = (
+            ("runtime.py", 'password = decode(f"{1234 + 5678:04d}")'),
+            ("runtime.cs", 'password = decode($"{1234 + 5678:D4}");'),
+            ("runtime.py", 'password = decode(f"{1234 + 5678=!r}")'),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                self.assertEqual(
+                    self.helper["validate_review_patch"](
+                        "local unstaged diff",
+                        [rel],
+                        patch,
+                    ),
+                    patch,
+                )
+
+    def test_review_patch_redacts_numeric_string_coercion(self) -> None:
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + 'word = decode(`${String(1234)+5678}`);\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn("1234", redacted_patch)
+        self.assertNotIn("5678", redacted_patch)
+
+    def test_review_patch_redacts_numeric_array_coercion(self) -> None:
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + "word = decode(`${[] + 1234 + 5678}`);\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn("1234", redacted_patch)
+        self.assertNotIn("5678", redacted_patch)
+
+    def test_review_patch_redacts_numeric_fields_after_unary_plus(self) -> None:
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + "word = decode(`${1234}${+5678}`);\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn("1234", redacted_patch)
+        self.assertNotIn("5678", redacted_patch)
+
+    def test_review_patch_redacts_based_non_javascript_interpolation_integers(
+        self,
+    ) -> None:
+        cases = (
+            ("runtime.py", "0xA1B2C3D4"),
+            ("runtime.py", "0x_A1B2C3D4"),
+            ("runtime.py", "0b10101010110011001111000011110000"),
+            ("runtime.py", "0b_10101010110011001111000011110000"),
+            ("runtime.py", "0o12345670123"),
+            ("runtime.py", "0o_12345670123"),
+            ("runtime.cs", "0xA1B2C3D4"),
+            ("runtime.cs", "0x_A1B2C3D4"),
+            ("runtime.cs", "0b10101010110011001111000011110000"),
+            ("runtime.cs", "0b_10101010110011001111000011110000"),
+        )
+        for rel, fixture_value in cases:
+            marker = "f" if rel.endswith(".py") else "$"
+            terminator = "" if rel.endswith(".py") else ";"
+            source = (
+                "pass"
+                + f'word = decode({marker}"{{{fixture_value}}}"){terminator}'
+            )
+            with self.subTest(rel=rel, fixture_value=fixture_value):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn("{redacted}", redacted_patch)
+
+    def test_review_patch_redacts_based_integers_rendering_as_eight_digits(
+        self,
+    ) -> None:
+        fixture_value = "0xFFFFFF"
+        cases = (
+            (
+                "runtime.ts",
+                'pass' + f'word = decode(`${{{fixture_value}}}`);',
+            ),
+            (
+                "runtime.py",
+                'pass' + f'word = decode(f"{{{fixture_value}}}")',
+            ),
+            (
+                "runtime.cs",
+                'pass' + f'word = decode($"{{{fixture_value}}}");',
+            ),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn("{redacted}", redacted_patch)
+
+    def test_review_patch_redacts_interpolation_format_spec_literals(self) -> None:
+        fixture_value = "Abc123Def456"
+        cases = (
+            (
+                "runtime.py",
+                'pass'
+                + f'word = prompt(f"{{value:{{width}}{fixture_value}}}")',
+            ),
+            (
+                "runtime.cs",
+                'pass' + f'word = prompt($"{{value:{fixture_value}}}");',
+            ),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn("redacted", redacted_patch)
+
+    def test_review_patch_redacts_format_specs_beginning_with_punctuation(
+        self,
+    ) -> None:
+        fixture_value = "Abc123Def456"
+        cases = (
+            ("runtime.py", f'pass' + f'word = decode(f"{{value:={fixture_value}}}")'),
+            ("runtime.py", f'pass' + f'word = decode(f"{{value::{fixture_value}}}")'),
+            ("runtime.cs", f'pass' + f'word = decode($"{{value:={fixture_value}}}");'),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel, source=source):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn("redacted", redacted_patch)
+
+    def test_review_patch_preserves_csharp_alias_qualifier_colons(self) -> None:
+        for expression in (
+            "global::Namespace.Value",
+            "Vendor::Namespace.Value",
+            "@vendor::Namespace.Value",
+            "new global::VeryLongNamespace.Type()",
+            "Get<global::VeryLongNamespace.Type>()",
+        ):
+            with self.subTest(expression=expression):
+                format_start = self.helper["top_level_interpolation_format_start"](
+                    expression,
+                    0,
+                    len(expression),
+                    dialect="csharp",
+                )
+
+                self.assertIsNone(format_start)
+
+    def test_review_patch_preserves_csharp_alias_qualifier_source(self) -> None:
+        expression = "new global::VeryLongNamespace.Type()"
+        source = "pass" + f'word = decode($"{{{expression}}}");'
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.cs"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_review_patch_redacts_csharp_format_starting_with_colon(self) -> None:
+        fixture_value = "Abc123Def456"
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + 'word = decode($"{(x)::'
+            + fixture_value
+            + '}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cs"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('$"{(x):redacted}"', redacted_patch)
+
+    def test_review_patch_preserves_csharp_conditional_colon_as_source(self) -> None:
+        source = (
+            "pass"
+            + 'word = decode($"{(flag ? SafeIdentifier1234 : OtherIdentifier5678)}");'
+        )
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cs"],
+            patch,
+        )
+
+        self.assertIn(source, redacted_patch)
+
+    def test_review_patch_redacts_csharp_format_after_nullable_generic(self) -> None:
+        fixture_value = "ProdSecret123"
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = decode($"{{Get<int?>():{fixture_value}}}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cs"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('{Get<int?>():redacted}', redacted_patch)
+
+    def test_review_patch_preserves_unicode_interpolation_identifiers(self) -> None:
+        identifier = "变量12345678"
+        cases = (
+            ("runtime.ts", 'pass' + f'word = decode(`${{{identifier}}}`);'),
+            ("runtime.py", 'pass' + f'word = decode(f"{{{identifier}}}")'),
+            ("runtime.cs", 'pass' + f'word = decode($"{{{identifier}}}");'),
+            (
+                "runtime.ts",
+                r"password = decode(`${\u{53D8}\u{91CF}12345678}`);",
+            ),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel, source=source):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertIn(source, redacted_patch)
+
+    def test_review_patch_balances_ordinary_interpolated_call_parentheses(
+        self,
+    ) -> None:
+        fixture_value = "Prod)Secret123"
+        cases = (
+            (
+                "runtime.py",
+                'pass'
+                + f'word = runCommand(f"{{get("{fixture_value}")}}")',
+            ),
+            (
+                "runtime.cs",
+                'pass'
+                + f'word = runCommand($"{{Get("{fixture_value}")}}");',
+            ),
+        )
+        for rel, source in cases:
+            with self.subTest(rel=rel):
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn('("redacted")', redacted_patch)
+
+    def test_review_patch_parses_non_interpolated_csharp_verbatim_strings(
+        self,
+    ) -> None:
+        fixture_value = "ProdSecret123"
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = runCommand(@"C:\\\", "{fixture_value}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cs"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('runCommand(@"C:\\\", "redacted")', redacted_patch)
+
+    def test_review_patch_handles_csharp_interpolation_comment_terminator(
+        self,
+    ) -> None:
+        fixture_value = "Abc1234"
+        terminator = "\u0085"
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = decode($"{fixture_value}'
+            + f'{{Get(value // note{terminator} ?? fallback)}}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cs"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn(
+            f'{{Get(value // note{terminator} ?? fallback)}}',
+            redacted_patch,
+        )
+
+    def test_review_patch_handles_unicode_terminator_in_csharp_call_comment(
+        self,
+    ) -> None:
+        fixture_value = "ProdSecret123"
+        terminator = "\u0085"
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = runCommand(value, // note{terminator}"{fixture_value}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cs"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn(f'// note{terminator}"redacted"', redacted_patch)
+
+    def test_review_patch_does_not_parse_python_raw_string_as_c_family(self) -> None:
+        fixture_value = "Abc123(payload)Abc123"
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = prompt(R"{fixture_value}")\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('prompt(R"redacted")', redacted_patch)
+
+    def test_review_patch_preserves_prose_comment_inside_pem_context(self) -> None:
+        identifier = "AuthenticationConfigurationIdentifier"
+        body = "MIIEowIBAAKCAQEAcommented0123456789ABCDEF"
+        patch = (
+            "diff --git a/fixture.cc b/fixture.cc\n"
+            "--- a/fixture.cc\n"
+            "+++ b/fixture.cc\n"
+            "@@ -0,0 +1,4 @@\n"
+            "+// -----BEGIN "
+            + "PRIVATE KEY-----\n"
+            + f"+// note {identifier} stays visible\n"
+            + f"+// {body}\n"
+            + "+// -----END "
+            + "PRIVATE KEY-----\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.cc"],
+            patch,
+        )
+
+        self.assertIn(identifier, redacted_patch)
+        self.assertIn("+// redacted", redacted_patch)
+
     def test_review_patch_redacts_short_and_unquoted_fallbacks(self) -> None:
         for fallback in ('"hunter2"', "12345678"):
             with self.subTest(fallback=fallback):
@@ -3937,6 +8658,42 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     redacted_patch,
                 )
 
+    def test_review_patch_redacts_fallbacks_after_unicode_line_comments(
+        self,
+    ) -> None:
+        fixture_value = "Secret" + "123"
+        key = "password"
+        cases = (
+            ("runtime.ts", "\u2028", "||"),
+            ("runtime.js", "\u2029", "||"),
+            ("runtime.cs", "\u0085", "??"),
+        )
+        for rel, terminator, operator in cases:
+            with self.subTest(rel=rel):
+                source = (
+                    f"{key} = primary // note{terminator} "
+                    f'{operator} "{fixture_value}"'
+                )
+                patch = (
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"--- a/{rel}\n"
+                    f"+++ b/{rel}\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    [rel],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn(
+                    f'{terminator} {operator} "redacted"',
+                    redacted_patch,
+                )
+
     def test_review_patch_preserves_redaction_placeholder_fallback(self) -> None:
         patch = (
             "diff --git a/runtime.py b/runtime.py\n"
@@ -3955,6 +8712,26 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ),
             patch,
         )
+
+    def test_review_patch_rejects_arbitrary_redacted_prefix_as_placeholder(self) -> None:
+        arbitrary_value = "redacted-production"
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + f'word = "{arbitrary_value}"\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertNotIn(arbitrary_value, redacted_patch)
+        self.assertIn('pass' + 'word = "redacted"', redacted_patch)
 
     def test_review_patch_ignores_nested_fallback_operator_text(self) -> None:
         fixture_value = realistic_secret_value()
@@ -3976,6 +8753,212 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotIn(fixture_value, redacted_patch)
         self.assertIn('defaults["x || y"] || "redacted"', redacted_patch)
 
+    def test_review_patch_ignores_fallback_operator_inside_regex(self) -> None:
+        source = "password = /Abc123||Def456/;"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.ts"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_review_patch_redacts_composed_template_literals(self) -> None:
+        first = "Abc123"
+        second = "Def456"
+        source = (
+            'password = decode(`${"'
+            + first
+            + '".concat("'
+            + second
+            + '")}`)'
+        )
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(first, redacted_patch)
+        self.assertNotIn(second, redacted_patch)
+        self.assertIn(".concat(", redacted_patch)
+
+    def test_review_patch_preserves_regex_delimiters_during_redaction(self) -> None:
+        fixture_value = "Abc12345Def67890"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            f"+password = primary || /{fixture_value}/i;\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn("password = primary || /redacted/i;", redacted_patch)
+
+    def test_review_patch_preserves_groovy_slashy_assignment_delimiters(
+        self,
+    ) -> None:
+        fixture_value = "ProdSecret123"
+        cases = (
+            (
+                f"password = /{fixture_value}/",
+                "password = /redacted/",
+            ),
+            (
+                f"password = $/{fixture_value}/$",
+                "password = $/redacted/$",
+            ),
+            (
+                f"password = /{fixture_value}${{name}}/",
+                "password = /redacted${name}/",
+            ),
+        )
+        for source, expected in cases:
+            with self.subTest(source=source):
+                patch = (
+                    "diff --git a/runtime.groovy b/runtime.groovy\n"
+                    "--- a/runtime.groovy\n"
+                    "+++ b/runtime.groovy\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{source}\n"
+                )
+
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["runtime.groovy"],
+                    patch,
+                )
+
+                self.assertNotIn(fixture_value, redacted_patch)
+                self.assertIn(expected, redacted_patch)
+
+    def test_review_patch_scans_subscript_after_member_call(self) -> None:
+        fixture_value = "CorrectHorse7Battery"
+        source = f'password = credentials->get()["{fixture_value}"]'
+        patch = (
+            "diff --git a/runtime.cpp b/runtime.cpp\n"
+            "--- a/runtime.cpp\n"
+            "+++ b/runtime.cpp\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cpp"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('credentials->get()["redacted"]', redacted_patch)
+
+    def test_review_patch_preserves_chained_credential_lookup_keys(self) -> None:
+        for lookup in ('["access_token"]', '.get("access_token")'):
+            with self.subTest(lookup=lookup):
+                patch = (
+                    "diff --git a/runtime.ts b/runtime.ts\n"
+                    "--- a/runtime.ts\n"
+                    "+++ b/runtime.ts\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+password = response.json(){lookup};\n"
+                )
+
+                self.assertEqual(
+                    self.helper["validate_review_patch"](
+                        "local unstaged diff",
+                        ["runtime.ts"],
+                        patch,
+                    ),
+                    patch,
+                )
+
+    def test_review_patch_scans_csharp_pointer_member_call(self) -> None:
+        fixture_value = "CorrectHorse7Battery"
+        source = f'password = provider->Get()->Decode("{fixture_value}")'
+        patch = (
+            "diff --git a/runtime.cs b/runtime.cs\n"
+            "--- a/runtime.cs\n"
+            "+++ b/runtime.cs\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.cs"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('provider->Get()->Decode("redacted")', redacted_patch)
+
+    def test_review_patch_scans_fallback_after_swift_raw_string(self) -> None:
+        fixture_value = "CorrectHorse7Battery"
+        patch = (
+            "diff --git a/runtime.swift b/runtime.swift\n"
+            "--- a/runtime.swift\n"
+            "+++ b/runtime.swift\n"
+            "@@ -0,0 +1 @@\n"
+            f'+password = (#"safe"# as String?) ?? "{fixture_value}"\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.swift"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('(#"safe"# as String?) ?? "redacted"', redacted_patch)
+
+    def test_review_patch_redacts_swift_regex_inside_interpolation(self) -> None:
+        fixture_value = "CorrectHorse7Battery"
+        source = (
+            'password = "\\(String(describing: #/'
+            + fixture_value
+            + '/#))"'
+        )
+        patch = (
+            "diff --git a/runtime.swift b/runtime.swift\n"
+            "--- a/runtime.swift\n"
+            "+++ b/runtime.swift\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{source}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.swift"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn("#/redacted/#", redacted_patch)
+
     def test_review_patch_ignores_fallback_literals_inside_comments(self) -> None:
         patch = (
             "diff --git a/runtime.ts b/runtime.ts\n"
@@ -3995,12 +8978,33 @@ class AutoreviewHardeningTests(unittest.TestCase):
             fragments,
         )
         self.assertIn('+import("evil-package");', redacted_patch)
-        with self.assertRaisesRegex(SystemExit, "secret-like content"):
+        self.assertEqual(
             self.helper["validate_review_patch"](
                 "local unstaged diff",
                 ["runtime.ts"],
                 patch,
-            )
+            ),
+            patch,
+        )
+
+    def test_review_patch_redacts_secret_like_fallback_comment(self) -> None:
+        fixture_value = "CorrectHorse7Battery"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            f'+password = primary || secondary // "{fixture_value}"\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted_patch)
+        self.assertIn('// "redacted"', redacted_patch)
 
     def test_review_patch_learns_bearer_credential_without_prefix(self) -> None:
         bearer_value = "AbcdEFGHijklMNOPqrstUVWX+SensitiveTail123=="
@@ -4156,6 +9160,33 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotIn("AB12", redacted)
         self.assertNotIn("CDef3456GHij7890", redacted)
 
+    def test_review_patch_redacts_short_known_private_key_chunk_in_comment(
+        self,
+    ) -> None:
+        patch = (
+            "diff --git a/fixture.ts b/fixture.ts\n"
+            "--- a/fixture.ts\n"
+            "+++ b/fixture.ts\n"
+            "@@ -0,0 +1,5 @@\n"
+            "+-----BEGIN "
+            + "PRIVATE KEY-----\n"
+            "+AB12\n"
+            "+-----END "
+            + "PRIVATE KEY-----\n"
+            "+// AB12\n"
+            "+const output = `${value /* AB12 */}`;\n"
+        )
+
+        redacted = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.ts"],
+            patch,
+        )
+
+        self.assertNotIn("AB12", redacted)
+        self.assertIn("+// redacted", redacted)
+        self.assertIn("`${value /* redacted */}`", redacted)
+
     def test_review_patch_redacts_padded_private_key_tail_quanta(self) -> None:
         for tail in ("AQ==", "AQI="):
             with self.subTest(tail=tail):
@@ -4197,8 +9228,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
         )
 
         self.assertNotIn(chunks, redacted)
-        self.assertIn("+redacted redacted redacted", redacted)
-        self.assertIn('+log("redacted redacted redacted")', redacted)
+        self.assertIn("+redacted-a redacted-b redacted-c", redacted)
+        self.assertIn(
+            '+log("redacted-a redacted-b redacted-c")',
+            redacted,
+        )
 
     def test_review_patch_redacts_markerless_private_key_body_in_string(self) -> None:
         body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC1234567890abcdef"
@@ -4352,6 +9386,50 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 patch,
             )
 
+    def test_review_patch_redacts_known_secret_after_python_floor_division(
+        self,
+    ) -> None:
+        fixture_value = "ProdSecret123"
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -1 +1 @@\n"
+            + "-pass"
+            + f'word = "{fixture_value}"\n'
+            + f'+values = [total // divisor, "{fixture_value}"]\n'
+        )
+
+        redacted = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.py"],
+            patch,
+        )
+
+        self.assertNotIn(fixture_value, redacted)
+        self.assertIn('+values = [total // divisor, "redacted"]', redacted)
+
+    def test_review_patch_rejects_cross_dialect_comment_source_collision(
+        self,
+    ) -> None:
+        fixture_value = "Evil1234"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.py\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            + " pass"
+            + f'word = "{fixture_value}"\n'
+            + f" value // {fixture_value}\n"
+        )
+
+        with self.assertRaisesRegex(SystemExit, "known secret-like value"):
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.ts", "runtime.py"],
+                patch,
+            )
+
     def test_review_patch_redacts_known_secret_in_hunk_header(self) -> None:
         fixture_value = realistic_secret_value()
         patch = (
@@ -4395,7 +9473,163 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotIn(prefix, redacted_patch)
         self.assertNotIn(longer, redacted_patch)
         self.assertNotIn("SensitiveTail9", redacted_patch)
-        self.assertIn('+log("redacted");', redacted_patch)
+        self.assertRegex(redacted_patch, r'\+log\("redacted-[a-z-]+"\);')
+
+    def test_review_patch_keeps_distinct_secret_fragment_identity(self) -> None:
+        old_value = "AlphaSecret123"
+        new_value = "MuchLongerBetaSecret456" + "Value"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -1,2 +1,2 @@\n"
+            + f'-pass{"word"} = "{old_value}";\n'
+            + f'-runCommand("{old_value}");\n'
+            + f'+pass{"word"} = "{new_value}";\n'
+            + f'+runCommand("{new_value}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        old_pattern = r'-pass' + r'word = "(redacted-[a-z]+)";'
+        new_pattern = r'\+pass' + r'word = "(redacted-[a-z]+)";'
+        old_match = re.search(old_pattern, redacted_patch)
+        new_match = re.search(new_pattern, redacted_patch)
+        self.assertIsNotNone(old_match)
+        self.assertIsNotNone(new_match)
+        assert old_match is not None and new_match is not None
+        old_label = old_match.group(1)
+        new_label = new_match.group(1)
+        self.assertEqual(old_label, "redacted-a")
+        self.assertEqual(new_label, "redacted-b")
+        self.assertIn(f'-runCommand("{old_label}");', redacted_patch)
+        self.assertIn(f'+runCommand("{new_label}");', redacted_patch)
+
+    def test_review_patch_keeps_private_key_body_identity(self) -> None:
+        old_body = "AB12cd34EF56"
+        new_body = "ZX98yx76WV54"
+        private_key_end = "END " + "PRIVATE KEY"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -1,3 +1,6 @@\n"
+            f" -----{PRIVATE_KEY_BEGIN_TEXT}-----\n"
+            f"-{old_body}\n"
+            f"+{new_body}\n"
+            f" -----{private_key_end}-----\n"
+            f"+-----{PRIVATE_KEY_BEGIN_TEXT}-----\n"
+            f"+{old_body}\n"
+            f"+-----{private_key_end}-----\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(old_body, redacted_patch)
+        self.assertNotIn(new_body, redacted_patch)
+        self.assertEqual(redacted_patch.count("redacted-a"), 2)
+        self.assertEqual(redacted_patch.count("redacted-b"), 1)
+
+    def test_review_patch_keeps_secret_identity_across_files(self) -> None:
+        first = "AlphaSecret123"
+        second = "MuchLongerBetaSecret456Value"
+        patch = (
+            "diff --git a/a.ts b/a.ts\n"
+            "--- a/a.ts\n"
+            "+++ b/a.ts\n"
+            "@@ -1 +1 @@\n"
+            + f'-pass{"word"} = "{first}";\n'
+            + f'+pass{"word"} = "{second}";\n'
+            + "diff --git a/b.ts b/b.ts\n"
+            + "--- a/b.ts\n"
+            + "+++ b/b.ts\n"
+            + "@@ -1 +1 @@\n"
+            + f'-pass{"word"} = "{second}";\n'
+            + f'+pass{"word"} = "{first}";\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["a.ts", "b.ts"],
+            patch,
+        )
+
+        self.assertEqual(redacted_patch.count('pass' + 'word = "redacted-a";'), 2)
+        self.assertEqual(redacted_patch.count('pass' + 'word = "redacted-b";'), 2)
+
+    def test_review_patch_reserves_existing_placeholder_labels(self) -> None:
+        first = "AlphaSecret123"
+        second = "BetaSecret456"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -1 +1,2 @@\n"
+            + f'-pass{"word"} = "{first}";\n'
+            + f'+pass{"word"} = "{second}";\n'
+            + '+const marker = "redacted-a";\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertIn('const marker = "redacted-a";', redacted_patch)
+        self.assertIn('pass' + 'word = "redacted-b";', redacted_patch)
+        self.assertIn('pass' + 'word = "redacted-c";', redacted_patch)
+
+    def test_review_patch_labels_lone_secret_beside_bare_placeholder(self) -> None:
+        fixture_value = "ProdSecret123"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1,2 @@\n"
+            '+const marker = "redacted";\n'
+            + f'+pass{"word"} = "{fixture_value}";\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertIn('const marker = "redacted";', redacted_patch)
+        self.assertIn('pass' + 'word = "redacted-a";', redacted_patch)
+
+    def test_review_patch_keeps_hunk_header_fragment_identity(self) -> None:
+        first = "AlphaSecret123"
+        second = "BetaSecret456"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            + f'@@ -0,0 +1,2 @@ pass{"word"} = "{first}"\n'
+            + f'+pass{"word"} = "{first}";\n'
+            + "+to"
+            + f'ken = "{second}";\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertIn('@@ -0,0 +1,2 @@ password = "redacted-a"', redacted_patch)
+        self.assertIn('+password = "redacted-a";', redacted_patch)
+        self.assertIn('+token = "redacted-b";', redacted_patch)
 
     def test_review_patch_learns_secret_from_hunk_header(self) -> None:
         fixture_value = realistic_secret_value()
@@ -4455,7 +9689,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertNotIn(body, redacted_patch)
         self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted_patch)
-        self.assertIn('+log("redacted");', redacted_patch)
+        self.assertIn('+log("redacted-a");', redacted_patch)
 
     def test_review_patch_redacts_escaped_alphabetic_explicit_pem_body(self) -> None:
         body = "AbCdEfGh" + "IjKlMnOp"
@@ -4555,6 +9789,75 @@ class AutoreviewHardeningTests(unittest.TestCase):
         )
 
         self.assertIn(identifier, redacted_patch)
+
+    def test_review_patch_preserves_call_target_inside_explicit_pem_context(self) -> None:
+        identifier = "evilCall" + "1234"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1,3 @@\n"
+            "+// -----BEGIN "
+            + "PRIVATE KEY-----\n"
+            + f"+{identifier}();\n"
+            + "+// -----END "
+            + "PRIVATE KEY-----\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertIn(f"+{identifier}();", redacted_patch)
+
+    def test_review_patch_redacts_call_like_private_key_text_inside_string(
+        self,
+    ) -> None:
+        body = "AbCdEfGhIjKlMnOpQrStUvWxYz" + "012345"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1,3 @@\n"
+            "+// -----BEGIN PRIVATE KEY-----\n"
+            f'+const payload = "{body}(";\n'
+            "+// -----END PRIVATE KEY-----\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(body, redacted_patch)
+        self.assertIn('"redacted("', redacted_patch)
+
+    def test_review_patch_redacts_pem_body_before_later_parenthesis(self) -> None:
+        body = "AbCdEfGh1234" + "IjKlMnOp"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1,4 @@\n"
+            "+// -----BEGIN "
+            + "PRIVATE KEY-----\n"
+            + f"+{body}\n"
+            + "+(\n"
+            + "+// -----END "
+            + "PRIVATE KEY-----\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(body, redacted_patch)
+        self.assertIn("+redacted\n+(\n", redacted_patch)
 
     def test_review_patch_rejects_residual_hunk_header_secret_risk(self) -> None:
         primary = "CorrectHorse7" + "Battery"
@@ -6829,6 +12132,139 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertLess(time.monotonic() - started, 5.0)
 
+    def test_csharp_interpolation_source_scan_bounds_unterminated_quote_run(
+        self,
+    ) -> None:
+        content = '"' * 100_000
+        started = time.monotonic()
+
+        self.helper["interpolation_source_ranges"](
+            content,
+            javascript_dialect="csharp",
+        )
+
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_csharp_string_context_scan_bounds_unterminated_quote_run(
+        self,
+    ) -> None:
+        quote_run = '"' * 100_000
+        content = quote_run + "ProdSecret123"
+        position = len(quote_run)
+        started = time.monotonic()
+
+        contexts = self.helper["string_contexts_at"](
+            content,
+            {position},
+            javascript_dialect="csharp",
+        )
+
+        self.assertIsNone(contexts[position])
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_csharp_string_context_scan_bounds_many_raw_literals(self) -> None:
+        parts: list[str] = []
+        positions: set[int] = set()
+        cursor = 0
+        for index in range(4_000):
+            if parts:
+                parts.append(";")
+                cursor += 1
+            literal = f'"""Value{index:08d}"""'
+            positions.add(cursor + 3)
+            parts.append(literal)
+            cursor += len(literal)
+        content = "".join(parts)
+        started = time.monotonic()
+
+        contexts = self.helper["string_contexts_at"](
+            content,
+            positions,
+            javascript_dialect="csharp",
+        )
+
+        self.assertTrue(all(contexts[position] is not None for position in positions))
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_csharp_raw_scan_bounds_near_delimiter_quote_run(self) -> None:
+        width = 20_000
+        text = '"' * width + "x" + '"' * (width - 1) + "x" + '"' * width
+        started = time.monotonic()
+
+        literal = self.helper["csharp_raw_literal_span"](
+            text,
+            0,
+            len(text),
+        )
+
+        self.assertIsNotNone(literal)
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_c_family_raw_scan_rejects_many_unterminated_openers_once(self) -> None:
+        content = 'R"x(' * 25_000
+        started = time.monotonic()
+
+        with self.assertRaisesRegex(
+            SystemExit,
+            "unterminated C-family raw string",
+        ):
+            self.helper["quoted_literal_value_spans"](
+                content,
+                0,
+                len(content),
+                javascript_dialect="c-family",
+            )
+
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_csharp_comment_fragment_scan_bounds_unterminated_quote_run(
+        self,
+    ) -> None:
+        content = '"' * 100_000
+        started = time.monotonic()
+
+        self.helper["comment_fragment_line_spans"](
+            content,
+            None,
+            javascript_dialect="csharp",
+        )
+
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_comment_fragment_scan_skips_text_without_fragment(self) -> None:
+        scanner = mock.Mock()
+        helper = self.helper["comment_fragment_line_spans"]
+        with mock.patch.dict(
+            helper.__globals__,
+            {"quoted_literal_value_spans": scanner},
+        ):
+            spans = helper(
+                '"""${ambiguous}"""',
+                re.compile("missing-fragment"),
+                javascript_dialect=None,
+            )
+
+        self.assertEqual(spans, {})
+        scanner.assert_not_called()
+
+    def test_private_key_body_scan_reuses_reference_mask(self) -> None:
+        content = "\n".join(
+            f"Chunk{index:04d}AbcDef1234"
+            for index in range(100)
+        )
+        masker = mock.Mock(
+            wraps=self.helper["mask_reference_declaration_evidence"]
+        )
+        scanner = self.helper["explicit_private_key_body_spans"]
+
+        with mock.patch.dict(
+            scanner.__globals__,
+            {"mask_reference_declaration_evidence": masker},
+        ):
+            scanner(content, in_pem=True)
+
+        masker.assert_called_once_with(content)
+
     def test_csharp_context_scan_is_bounded_across_many_uris(self) -> None:
         content = "\n".join(
             f'void Run{index}() {{ dsn=$@"https://user:'
@@ -7349,6 +12785,28 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 "pass"
                 + 'word = response.get("CORRECTHORSE'
                 + 'BATTERYSTAPLE")'
+            )
+        )
+
+    def test_secret_detector_normalizes_c_family_member_operators(self) -> None:
+        for content in (
+            'password = headers->get("Authorization")',
+            'password = headers::get("Authorization")',
+            'password = ui->prompt("Enter password for Service2")',
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="c-family",
+                    )
+                )
+
+    def test_secret_detector_allows_csharp_alias_qualified_reference(self) -> None:
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                "password = global::Credentials.Value;",
+                javascript_dialect="csharp",
             )
         )
 
