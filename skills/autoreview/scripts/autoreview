@@ -193,6 +193,9 @@ SECRET_ASSIGNMENT_KEY_PATTERN = (
     rf"|(?<![A-Za-z0-9]){SECRET_ASSIGNMENT_KEY_NAME_PATTERN}"
     rf"(?![A-Za-z0-9]))"
 )
+# A colon before an explicit Boolean type is an annotation, not a value.
+# Only scan the initializer after `=` so real credential literals still fail closed.
+SECRET_BOOLEAN_TYPE_PATTERN = r"(?-i:Boolean\??|boolean|Bool\??)"
 SECRET_ASSIGNMENT_PATTERN = re.compile(
     rf"(?i){SECRET_ASSIGNMENT_KEY_PATTERN}\s*[:=]\s*"
     r"(?:\"(?P<double_value>[^\"\r\n]{8,})\"|"
@@ -210,6 +213,14 @@ SECRET_ASSIGNMENT_PATTERN = re.compile(
 SECRET_ASSIGNMENT_PREFIX_PATTERN = re.compile(
     rf"(?i){SECRET_ASSIGNMENT_KEY_PATTERN}"
     r"\s*(?:=(?!=|>)|:(?![:=]))\s*"
+)
+SECRET_BOOLEAN_DECLARATION_PATTERN = re.compile(
+    r"(?im)^[ \t]*(?:(?:abstract|const|declare|export|final|internal|lateinit|"
+    r"open|override|private|protected|public|readonly|static)\s+)*"
+    rf"(?:val|var|let|const)\s+"
+    rf"(?P<boolean_key>{SECRET_ASSIGNMENT_KEY_PATTERN})\s*:\s*"
+    rf"(?P<boolean_type>{SECRET_BOOLEAN_TYPE_PATTERN})"
+    r"(?=\s*(?:=|[,;)\]}]|$))"
 )
 PRIVATE_KEY_BOUNDARY_PREFIX = r"-----"
 PRIVATE_KEY_BEGIN_PATTERN = re.compile(
@@ -5307,6 +5318,67 @@ def unsafe_multiline_self_reference_assignment(
     )
 
 
+def boolean_declaration_initializer_range(
+    text: str,
+    match: re.Match[str],
+    *,
+    javascript_dialect: str | None = None,
+) -> tuple[int, int] | None:
+    initializer = re.match(r"\s*=\s*", text[match.end() :])
+    if initializer is None:
+        return None
+    start = match.end() + initializer.end()
+    expression = fallback_expression(
+        text[start:],
+        typescript=javascript_dialect == "typescript",
+    )
+    return start, start + len(expression)
+
+
+def boolean_declaration_initializer_risk(
+    text: str,
+    match: re.Match[str],
+    *,
+    javascript_dialect: str | None = None,
+) -> bool:
+    initializer_range = boolean_declaration_initializer_range(
+        text,
+        match,
+        javascript_dialect=javascript_dialect,
+    )
+    if initializer_range is None:
+        return False
+    start, end = initializer_range
+    return secret_literal_risk(
+        text[start:end],
+        minimum_length=8,
+        javascript_dialect=javascript_dialect,
+    )
+
+
+def boolean_declaration_initializer_spans(
+    text: str,
+    match: re.Match[str],
+    *,
+    javascript_dialect: str | None = None,
+) -> list[tuple[int, int]]:
+    initializer_range = boolean_declaration_initializer_range(
+        text,
+        match,
+        javascript_dialect=javascript_dialect,
+    )
+    if initializer_range is None:
+        return []
+    start, end = initializer_range
+    if not secret_literal_risk(
+        text[start:end],
+        minimum_length=8,
+        javascript_dialect=javascript_dialect,
+    ):
+        return []
+    return top_level_fallback_value_spans(text, start, end)
+
+
 def secret_text_risk(
     text: str,
     *,
@@ -5315,6 +5387,19 @@ def secret_text_risk(
     uri_authorities = uri_authority_ranges(text)
     if credentialed_uri_risk(text, uri_authorities) or basic_authorization_risk(text) or any(
         pattern.search(text) for pattern in SECRET_VALUE_PATTERNS
+    ):
+        return True
+    boolean_declarations = tuple(SECRET_BOOLEAN_DECLARATION_PATTERN.finditer(text))
+    boolean_declaration_positions = {
+        match.start("boolean_key") for match in boolean_declarations
+    }
+    if any(
+        boolean_declaration_initializer_risk(
+            text,
+            match,
+            javascript_dialect=javascript_dialect,
+        )
+        for match in boolean_declarations
     ):
         return True
     safe_uri_credentials = interpolated_empty_password_uri_ranges(
@@ -5338,6 +5423,8 @@ def secret_text_risk(
         else frozenset()
     )
     for prefix in assignment_prefixes:
+        if prefix.start() in boolean_declaration_positions:
+            continue
         assignment = SECRET_ASSIGNMENT_PATTERN.match(text, prefix.start())
         if assignment is not None and safe_self_reference_assignment(
             text,
@@ -5369,6 +5456,8 @@ def secret_text_risk(
         assignment_scan_text,
         safe_uri_credentials,
     ):
+        if match.start() in boolean_declaration_positions:
+            continue
         quoted = any(
             match.group(name) is not None
             for name in ("double_value", "single_value", "backtick_value")
@@ -5861,8 +5950,22 @@ def review_repeatable_secret_spans(
     *,
     javascript_dialect: str | None = None,
 ) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
+    boolean_declarations = tuple(SECRET_BOOLEAN_DECLARATION_PATTERN.finditer(text))
+    boolean_declaration_positions = {
+        match.start("boolean_key") for match in boolean_declarations
+    }
+    spans = [
+        span
+        for match in boolean_declarations
+        for span in boolean_declaration_initializer_spans(
+            text,
+            match,
+            javascript_dialect=javascript_dialect,
+        )
+    ]
     for match in SECRET_ASSIGNMENT_PATTERN.finditer(text):
+        if match.start() in boolean_declaration_positions:
+            continue
         selected_name = next(
             (
                 name
@@ -5935,8 +6038,22 @@ def review_secret_value_spans(
     *,
     javascript_dialect: str | None = None,
 ) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
+    boolean_declarations = tuple(SECRET_BOOLEAN_DECLARATION_PATTERN.finditer(text))
+    boolean_declaration_positions = {
+        match.start("boolean_key") for match in boolean_declarations
+    }
+    spans = [
+        span
+        for match in boolean_declarations
+        for span in boolean_declaration_initializer_spans(
+            text,
+            match,
+            javascript_dialect=javascript_dialect,
+        )
+    ]
     for match in SECRET_ASSIGNMENT_PATTERN.finditer(text):
+        if match.start() in boolean_declaration_positions:
+            continue
         for name in (
             "double_value",
             "single_value",
