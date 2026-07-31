@@ -225,6 +225,38 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             args = AUTOREVIEW.parse_args()
         self.assertEqual(args.cursor_bin, "/tmp/legacy-cursor")
 
+    def test_no_flag_default_is_codex_sol_medium(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(sys, "argv", ["autoreview"]):
+                args = AUTOREVIEW.parse_args()
+            reviewers = AUTOREVIEW.reviewer_args(args)
+
+        self.assertEqual(len(reviewers), 1)
+        self.assertEqual(reviewers[0].engine, "codex")
+        self.assertEqual(reviewers[0].model, "gpt-5.6-sol")
+        self.assertEqual(reviewers[0].thinking, "medium")
+
+    def test_no_flag_panel_keeps_distinct_claude_and_codex_reviewers(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(sys, "argv", ["autoreview", "--panel"]):
+                args = AUTOREVIEW.parse_args()
+            reviewers = AUTOREVIEW.reviewer_args(args)
+
+        self.assertEqual([reviewer.engine for reviewer in reviewers], ["codex", "claude"])
+
+    def test_explicit_non_default_claude_model_does_not_inherit_opus_effort(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(
+                sys,
+                "argv",
+                ["autoreview", "--engine", "claude", "--model", "claude-haiku-4-5"],
+            ):
+                args = AUTOREVIEW.parse_args()
+            reviewer = AUTOREVIEW.reviewer_args(args)[0]
+
+        self.assertEqual(reviewer.model, "claude-haiku-4-5")
+        self.assertIsNone(reviewer.thinking)
+
     def test_cursor_agent_bin_env_alias(self) -> None:
         with mock.patch.dict(
             os.environ,
