@@ -1,0 +1,4 @@
+interface:
+  display_name: "Govern Agent Stack"
+  short_description: "Govern stack capability adoption safely"
+  default_prompt: "Use $govern-agent-stack to evaluate and integrate this capability into my agent stack."
