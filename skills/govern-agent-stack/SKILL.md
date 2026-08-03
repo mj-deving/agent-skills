@@ -12,9 +12,10 @@ Keep evidence, policy, implementation, and runtime state separate.
 
 1. Read repository instructions and current runtime evidence.
 2. Load the first applicable operator policy when present:
+   - an explicitly supplied policy;
    - project-bound policy declared by repository instructions;
    - `~/projects/agent-skill-registry/config/agent-stack-policy.json`;
-   - an explicitly supplied policy.
+   Treat an explicit policy as the task-scoped override; do not silently merge conflicting policies.
 3. Treat external setups and dated research as evidence, never local authority.
 4. Use `govern-shared-skills` as the subordinate workflow for skill ownership, adapters,
    projections, loader collisions, and routing visibility.
