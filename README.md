@@ -17,6 +17,8 @@ repo. See [VISION.md](VISION.md) for catalog boundaries and admission principles
   a contract.
 - `crabbox`: Crabbox/Testbox remote validation workflow for broad or CI-parity
   proof.
+- `govern-shared-skills`: canonical ownership, projection, and drift-control
+  workflow for skills shared across agent harnesses.
 - `handoff`: path-free prompt handoff workflow for delegating a task to another
   agent.
 - `session-viewer`: local searchable HTML viewer for agent session JSONL.

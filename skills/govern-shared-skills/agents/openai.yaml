@@ -1,0 +1,4 @@
+interface:
+  display_name: "Govern Shared Skills"
+  short_description: "Canonical ownership and cross-harness drift control."
+  default_prompt: "Use $govern-shared-skills to install or audit this skill across agent harnesses without creating duplicate sources."
