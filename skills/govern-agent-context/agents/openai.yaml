@@ -1,0 +1,4 @@
+interface:
+  display_name: "Govern Agent Context"
+  short_description: "Design lazy agent knowledge routing"
+  default_prompt: "Use $govern-agent-context to structure this repository or knowledge base for low-cost agent discovery and precise lazy loading."
