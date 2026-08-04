@@ -2,6 +2,13 @@
 
 ![Agent Skills banner](docs/assets/readme-banner.jpg)
 
+> [!NOTE]
+> This repository is Marius's public integration fork of
+> [`openclaw/agent-skills`](https://github.com/openclaw/agent-skills). The `main`
+> branch tracks upstream; `integration` carries reviewed, public,
+> harness-neutral extensions. Private or identity-bound skills do not belong in
+> this repository.
+
 Shared skills for coding agents that work on OpenClaw projects.
 
 This repo is the public canonical source for common workflows such as review
