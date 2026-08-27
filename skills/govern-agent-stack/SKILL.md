@@ -44,6 +44,14 @@ Keep evidence, policy, implementation, and runtime state separate.
 10. Preview mutations. Apply only through the owning installer or registry. Verify idempotence and
     real routing/runtime behavior.
 
+## Completion Invariant
+
+An update is complete only when the canonical owner and immutable pin match, every declared
+projection converges, fresh behavior passes in each declared harness, and a second read-only check
+reports zero actions. Run the governing registry's scoped consolidation check; do not repair loader
+directories by hand. If any gate fails, report the exact verdict `update not complete`, identify the
+failing owner or projection, and keep the operational work item open.
+
 ## Decision rules
 
 - Prefer an existing native or canonical owner over a duplicate.
@@ -57,6 +65,8 @@ Keep evidence, policy, implementation, and runtime state separate.
   authority, polling frequency, or risk tolerance.
 - Do not call a capability installed until dependencies exist, permissions are granted, a fresh
   runtime discovers it, and its defining behavior is observed.
+- A scheduled or manual consolidation batch may detect drift, but it never gains authority to apply
+  changes; correction still runs through the canonical owner and its previewed lifecycle tool.
 
 ## Output
 

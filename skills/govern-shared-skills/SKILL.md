@@ -19,6 +19,22 @@ Keep one canonical owner for each logical skill and make every harness-visible c
 - Expose only useful global routing metadata. Avoid normalized-name collisions and redundant leaf catalogs.
 - Verify routing from a fresh harness session; filesystem presence alone does not prove discoverability.
 
+## Authoring Authority
+
+Use the neutral Agent Skills `SKILL.md` contract (`name`, `description`, and optional supporting
+resources) as the shared cross-harness baseline. Route edits by canonical owner:
+
+- LifeOS-owned skill: LifeOS `CreateSkill`; keep upstream bodies vanilla and put principal-specific
+  behavior in declared USER overlays or adapters.
+- Codex-native skill: native Codex `skill-creator`.
+- Shared cross-harness skill: neutral authoring workflow, then this skill and `govern-agent-stack`
+  for admission, pinning, and projections.
+- Vendor or plugin skill: vendor/package owner; local adapters only unless accepted upstream.
+- Project-local skill: owning repository and its target-harness contract.
+
+Do not mass-rewrite existing skills into a LifeOS-specific dialect. A harness may add an adapter,
+but the adapter does not become the canonical skill body.
+
 ## Default Visibility
 
 Use `global` for a reusable capability that should route in more than one project. Global does not mean copied everywhere: it means governed once and projected only into declared harnesses.
@@ -85,6 +101,9 @@ Do not classify by folder name. Inspect the owning repository, installer, update
 10. Run the aggregate live audit; require every visible entry to resolve to exactly one owner envelope.
 11. Verify links or generated hashes, executable helpers, hook targets, and platform-independent paths.
 12. Start a fresh session in each affected harness and verify the expected routing descriptions are model-visible.
+13. Run the governing registry's scoped read-only consolidation check. If any declared owner, pin,
+    projection, fresh behavior probe, or second zero-action check fails, report `update not complete`
+    and keep the operational work item open.
 
 ## Decision Rules
 
