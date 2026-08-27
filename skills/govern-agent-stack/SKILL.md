@@ -1,6 +1,6 @@
 ---
 name: govern-agent-stack
-description: "Govern evaluation, adoption, installation, update, and retirement of agent-stack capabilities across machines and harnesses. Use for a new CLI, skill, plugin, hook, MCP server, connector, archive, background service, remote runner, coding harness, macOS automation, or a proposal to copy another person's agent setup."
+description: "Govern evaluation, adoption, installation, update, propagation, and retirement of agent-stack capabilities across machines and harnesses. USE WHEN adding or changing a CLI, skill, plugin, hook, MCP server, connector, service, harness, automation, shared capability, or checking whether an update reached every harness. Report `update not complete` until owner, pin, projections, fresh behavior, and idempotence converge. NOT FOR authoring a canonical skill body without its owner workflow."
 ---
 
 # Govern Agent Stack

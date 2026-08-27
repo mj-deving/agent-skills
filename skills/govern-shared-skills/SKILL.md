@@ -1,6 +1,6 @@
 ---
 name: govern-shared-skills
-description: "Govern the complete skill lifecycle across Codex, Claude Code, OpenClaw, and other harnesses: classify global, router, native, generated, or project-local ownership; bind source, pins, budgets, projections, collisions, verification, and rollback. USE WHEN adding, installing, exposing, migrating, updating, or auditing any skill in any harness. NOT FOR authoring the canonical skill body without its owning skill-creation workflow."
+description: "Govern the complete skill lifecycle and skill-creator hierarchy across Codex, Claude Code, OpenClaw, and other harnesses. USE WHEN adding, authoring, installing, exposing, migrating, updating, propagating, or auditing a shared skill; deciding between LifeOS CreateSkill, native Codex skill-creator, vendor, or project ownership; or checking cross-harness consolidation. Report `update not complete` while any declared projection drifts. NOT FOR bypassing the canonical owner's authoring workflow."
 ---
 
 # Govern Shared Skills
