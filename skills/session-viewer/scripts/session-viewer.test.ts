@@ -7,6 +7,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 import { parseSessionDocument } from "./core/detect.ts";
 import { parseJsonl } from "./core/jsonl.ts";
+import { resolveOpenBrowserCommand } from "./open-browser.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -14,6 +15,20 @@ function parse(text: string) {
   const { records } = parseJsonl(text);
   return parseSessionDocument(records, "fixture.jsonl");
 }
+
+test("opens hostile Windows paths without a command shell", () => {
+  for (const filePath of [
+    "C:\\Reports\\session & calc.exe.html",
+    "C:\\Reports\\session | whoami.html",
+    "C:\\Reports\\%COMSPEC%.html",
+    "C:\\Reports\\session ^& echo injected.html",
+  ]) {
+    assert.deepEqual(resolveOpenBrowserCommand("win32", filePath), {
+      executable: "explorer.exe",
+      args: [filePath],
+    });
+  }
+});
 
 test("parses Codex rollout tool calls and outputs", () => {
   const doc = parse(
@@ -446,6 +461,33 @@ test("parses Pi/OpenClaw message and tool result entries", () => {
     doc.events.some((event) => event.kind === "tool_result"),
     true,
   );
+});
+
+test("keeps Pi/OpenClaw numeric message timestamps", () => {
+  const doc = parse(
+    JSON.stringify({
+      type: "message",
+      id: "m1",
+      message: { role: "assistant", timestamp: 1748165000000, content: [{ type: "text", text: "ok" }] },
+    }),
+  );
+  assert.equal(doc.format, "pi-openclaw");
+  assert.equal(doc.events[0]?.timestamp, "2025-05-25T09:23:20.000Z");
+});
+
+test("drops out-of-range Pi/OpenClaw numeric message timestamps", () => {
+  for (const timestamp of [1e300, Number.NaN, Number.POSITIVE_INFINITY, -8.64e15 - 1]) {
+    const doc = parse(
+      JSON.stringify({
+        type: "message",
+        id: "m1",
+        message: { role: "assistant", timestamp, content: [{ type: "text", text: "ok" }] },
+      }),
+    );
+    assert.equal(doc.format, "pi-openclaw");
+    assert.equal(doc.events.length, 1);
+    assert.equal(doc.events[0]?.timestamp, undefined);
+  }
 });
 
 test("parses Pi/OpenClaw direct image data blocks", () => {

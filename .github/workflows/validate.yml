@@ -5,6 +5,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   validate:
     runs-on: ${{ matrix.os }}
@@ -14,10 +17,10 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: '22'
-      - uses: actions/setup-python@v6
+          node-version: '26'
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.x'
       - name: Install Python dependencies
@@ -32,18 +35,12 @@ jobs:
         run: |
           python scripts/install-skills.test.py
           python scripts/validate-skills.test.py
-      - name: Run autoreview self-tests
-        run: |
-          python skills/autoreview/scripts/autoreview --self-test-config-defaults
-          python skills/autoreview/scripts/autoreview --self-test-fallback-scope
-          python skills/autoreview/scripts/autoreview --self-test-engine-isolation
-          python skills/autoreview/scripts/autoreview --self-test-json-array-parser
-          python skills/autoreview/scripts/autoreview --self-test-opencode-jsonl-parser
-          python skills/autoreview/scripts/autoreview --self-test-opencode-isolation
-          python skills/autoreview/scripts/autoreview --self-test-cursor-jsonl-parser
       - name: Run Python tests
-        run: python -m unittest skills/autoreview/scripts/autoreview_test.py skills.autoreview.tests.test_autoreview_hardening
+        run: python -m unittest skills/autoreview/scripts/autoreview_test.py skills.autoreview.tests.test_autoreview_hardening skills.autoreview.tests.test_codex_sandbox
       - name: Check Node scripts
-        run: node --check skills/agent-transcript/scripts/agent-transcript
+        run: |
+          node --check skills/agent-transcript/scripts/agent-transcript
+          node --check skills/beam/scripts/beam
+          node --check skills/beam/scripts/beam-session.js
       - name: Run Node tests
-        run: node --test skills/agent-transcript/scripts/agent-transcript.test.mjs skills/session-viewer/scripts/session-viewer.test.ts
+        run: node --test skills/agent-transcript/scripts/agent-transcript.test.mjs skills/beam/scripts/beam.test.mjs skills/session-viewer/scripts/session-viewer.test.ts
