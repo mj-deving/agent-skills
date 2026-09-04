@@ -1315,8 +1315,8 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
                 self.helper["scan_outgoing_review_pack"](repo, prompt)
 
             records = [json.loads(line) for line in (root / "scans.jsonl").read_text(encoding="utf-8").splitlines()]
-            self.assertEqual([record["source"] for record in records], ["filesystem", "filesystem", "stdin"])
-            self.assertEqual([record["prompt"] for record in records], [prompt, prompt, prompt])
+            self.assertEqual([record["source"] for record in records], ["filesystem", "stdin"])
+            self.assertEqual([record["prompt"] for record in records], [prompt, prompt])
             self.assertFalse(Path(records[0]["pack"]).parent.exists())
 
     def test_outgoing_pack_scan_reads_exact_prompt_including_deleted_lines(self) -> None:
@@ -1356,10 +1356,9 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
                 },
             ):
                 self.helper["scan_outgoing_review_pack"](repo, prompt)
-            self.assertEqual(sources, ["filesystem", "filesystem", "stdin"])
+            self.assertEqual(sources, ["filesystem", "stdin"])
 
-    def test_deleted_only_scanner_finding_is_redacted_before_provider_invocation(self) -> None:
-        dangerous = "".join(chr(value) for value in (100, 101, 108, 101, 116, 101, 45, 111, 110, 108, 121, 45, 118, 97, 108, 117, 101))
+    def test_deleted_input_scan_refusal_is_redacted_and_blocks_provider(self) -> None:
         prompt = (
             "# Change Bundle\n"
             "diff --git a/config.ts b/config.ts\n"
@@ -1367,20 +1366,30 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
             "--- a/config.ts\n"
             "+++ /dev/null\n"
             "@@ -1 +0,0 @@\n"
-            f"-const value = \"{dangerous}\";\n"
+            "-const apiKey = \"removed-but-still-sensitive\";\n"
         )
+        finding = {
+            "SourceMetadata": {
+                "Data": {
+                    "Filesystem": {
+                        "file": "review-pack.txt",
+                        "line": 7,
+                    }
+                }
+            },
+            "Raw": "must-not-be-printed",
+        }
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
-            scans: list[tuple[str, str]] = []
-            provider_prompts: list[str] = []
+            packs = []
+            provider = mock.Mock()
 
             def run_scanner(command, cwd, **_kwargs):
-                source = command[1]
-                payload = Path(command[2]).read_text(encoding="utf-8") if source == "filesystem" else _kwargs["stdin"].read().decode("utf-8")
-                scans.append((source, payload))
-                if dangerous not in payload:
-                    return subprocess.CompletedProcess(command, 0, "", "")
-                finding = {"SourceMetadata": {"Data": {"Filesystem": {"file": "review-pack.txt", "line": 7}}}}
+                self.assertEqual(command[1], "filesystem")
+                pack = Path(command[2])
+                self.assertEqual(pack.parent, cwd)
+                self.assertEqual(pack.read_bytes(), prompt.encode("utf-8"))
+                packs.append(pack)
                 return subprocess.CompletedProcess(
                     command, self.helper["TRUFFLEHOG_FINDINGS_EXIT_CODE"], json.dumps(finding) + "\n", "",
                 )
@@ -1390,64 +1399,21 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
                 {
                     "find_command": lambda _name, _repo: "/trusted/trufflehog",
                     "run": run_scanner,
-                    "run_engine": lambda _args, _repo, outgoing: provider_prompts.append(outgoing) or json.dumps({
-                        "findings": [], "overall_correctness": "patch is correct",
-                        "overall_explanation": "synthetic clean", "overall_confidence": 0.9,
-                    }),
+                    "run_engine": provider,
                 },
             ), contextlib.redirect_stderr(io.StringIO()):
-                self.helper["run_reviewer"](
-                    argparse.Namespace(engine="codex", max_priority="P0"), repo, prompt, set(), [],
-                )
-            self.assertEqual([source for source, _payload in scans], ["filesystem", "filesystem", "stdin"])
-            self.assertIn(dangerous, scans[0][1])
-            self.assertTrue(all(dangerous not in payload for _source, payload in scans[1:]))
-            self.assertEqual(len(provider_prompts), 1)
-            self.assertNotIn(dangerous, provider_prompts[0])
-            self.assertIn("-<redacted deleted line>", provider_prompts[0])
-
-    def test_added_or_mixed_scanner_findings_block_before_provider_invocation(self) -> None:
-        dangerous = "".join(chr(value) for value in (97, 100, 100, 101, 100, 45, 111, 110, 108, 121, 45, 118, 97, 108, 117, 101))
-        base = (
-            "# Change Bundle\n"
-            "diff --git a/config.ts b/config.ts\n"
-            "--- a/config.ts\n"
-            "+++ b/config.ts\n"
-            "@@ -1 +1 @@\n"
-        )
-        for changed, finding_lines in ((f"+const value = \"{dangerous}\";\n", (6,)), (f"-const old = \"{dangerous}\";\n+const new = \"{dangerous}\";\n", (6, 7))):
-            with self.subTest(finding_lines=finding_lines), tempfile.TemporaryDirectory() as tempdir:
-                repo = init_repo(Path(tempdir))
-                calls: list[str] = []
-
-                def run_scanner(command, _cwd, **_kwargs):
-                    calls.append(command[1])
-                    findings = [
-                        {"SourceMetadata": {"Data": {"Filesystem": {"file": "review-pack.txt", "line": line}}}}
-                        for line in finding_lines
-                    ]
-                    return subprocess.CompletedProcess(
-                        command, self.helper["TRUFFLEHOG_FINDINGS_EXIT_CODE"],
-                        "".join(json.dumps(finding) + "\n" for finding in findings), "",
+                with self.assertRaisesRegex(SystemExit, "TruffleHog found credentials") as error:
+                    self.helper["run_reviewer"](
+                        argparse.Namespace(engine="codex", max_priority="P0"), repo, prompt, set(), [],
                     )
-
-                with mock.patch.dict(self.helper["scan_outgoing_review_pack"].__globals__, {
-                    "find_command": lambda _name, _repo: "/trusted/trufflehog", "run": run_scanner,
-                }):
-                    with self.assertRaisesRegex(SystemExit, "TruffleHog found credentials"):
-                        self.helper["scan_outgoing_review_pack"](repo, base + changed)
-                self.assertEqual(calls, ["filesystem"])
-
-    def test_scanner_error_blocks_deleted_only_redaction(self) -> None:
-        prompt = "# Change Bundle\n"
-        with tempfile.TemporaryDirectory() as tempdir:
-            repo = init_repo(Path(tempdir))
-            with mock.patch.dict(self.helper["scan_outgoing_review_pack"].__globals__, {
-                "find_command": lambda _name, _repo: "/trusted/trufflehog",
-                "run": lambda command, _cwd, **_kwargs: subprocess.CompletedProcess(command, 1, "", ""),
-            }):
-                with self.assertRaisesRegex(SystemExit, "TruffleHog could not complete"):
-                    self.helper["scan_outgoing_review_pack"](repo, prompt)
+            self.assertEqual(len(packs), 1)
+            self.assertFalse(packs[0].parent.exists())
+            provider.assert_not_called()
+        self.assertEqual(
+            str(error.exception),
+            "refusing to send review pack: TruffleHog found credentials; "
+            "remove credential material from selected changes, prompt files, and datasets, then rerun",
+        )
 
     def test_outgoing_pack_scan_fails_closed_when_scanner_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -2063,15 +2029,15 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
                         self.assertEqual(source_kind, "stdin")
                         outgoing = Path(kwargs["stdin"].name)
                         payload = kwargs["stdin"].read()
-                    self.assertIn(payload, (pack.encode("utf-8"), pack.replace("-// DELETED_SCAN_MARKER", "-<redacted deleted line>").encode("utf-8")))
+                    self.assertEqual(payload, pack.encode("utf-8"))
                     if os.name != "nt":
                         self.assertEqual(stat.S_IMODE(outgoing.stat().st_mode), 0o600)
                     self.assertIn("--results=verified,unknown", command)
                     self.assertIn("--no-update", command)
-                    for token in ("+// STAGED_SCAN_MARKER", "UNTRACKED_SCAN_MARKER", "PROMPT_SCAN_MARKER", "# Dataset:", "# Prompt file:"):
-                        self.assertIn(token, payload.decode("utf-8"))
+                    for token in ("-// DELETED_SCAN_MARKER", "+// STAGED_SCAN_MARKER", "UNTRACKED_SCAN_MARKER", "PROMPT_SCAN_MARKER", "# Dataset:", "# Prompt file:"):
+                        self.assertIn(token, pack)
                     events.append(source_kind)
-                    if marker and (marker != "DELETED_SCAN_MARKER" or payload == pack.encode("utf-8")):
+                    if marker:
                         line = next(i for i, text in enumerate(pack.splitlines(), 1) if marker in text)
                         detected = {"SourceMetadata": {"Data": {"Filesystem": {"file": str(outgoing), "line": line}}}}
                         return subprocess.CompletedProcess(command, self.helper["TRUFFLEHOG_FINDINGS_EXIT_CODE"], json.dumps(detected), "")
@@ -2083,19 +2049,13 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
                 }):
                     args = argparse.Namespace(engine="codex", max_priority="P2")
                     if marker:
-                        if marker == "DELETED_SCAN_MARKER":
+                        with self.assertRaisesRegex(SystemExit, "refusing to send review pack"):
                             self.helper["run_reviewer"](args, repo, pack, {source}, [])
-                            provider.assert_called_once()
-                            self.assertNotIn(marker, provider.call_args.args[2])
-                        else:
-                            with self.assertRaisesRegex(SystemExit, "refusing to send review pack"):
-                                self.helper["run_reviewer"](args, repo, pack, {source}, [])
-                            provider.assert_not_called()
+                        provider.assert_not_called()
                     else:
                         self.helper["run_reviewer"](args, repo, pack, {source}, [])
                         provider.assert_called_once_with(args, repo, pack)
-                    expected = ["filesystem", "filesystem", "stdin"] if marker in (None, "DELETED_SCAN_MARKER") else ["filesystem"]
-                    self.assertEqual(events, expected)
+                    self.assertEqual(events, ["filesystem"] if marker else ["filesystem", "stdin"])
 
     def test_tracked_binary_changes_are_blocked_in_all_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

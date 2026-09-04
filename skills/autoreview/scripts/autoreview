@@ -1662,75 +1662,7 @@ def safe_trufflehog_env(repo: Path) -> dict[str, str]:
     return env
 
 
-def trufflehog_finding_line(finding: object) -> int | None:
-    """Return a verified one-based pack line number without exposing a finding."""
-    if not isinstance(finding, dict):
-        return None
-    try:
-        line = finding["SourceMetadata"]["Data"]["Filesystem"]["line"]
-    except (KeyError, TypeError):
-        return None
-    return line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else None
-
-
-def trufflehog_finding_lines(output: str) -> set[int] | None:
-    """Parse scanner locations fail-closed; scanner findings never leave this helper."""
-    lines: set[int] = set()
-    for record in output.splitlines():
-        try:
-            finding = json.loads(record)
-        except json.JSONDecodeError:
-            return None
-        line = trufflehog_finding_line(finding)
-        if line is None:
-            return None
-        lines.add(line)
-    return lines or None
-
-
-def redact_deleted_diff_lines(prompt: str, finding_lines: set[int]) -> str | None:
-    """Redact only scanner-proven deleted lines inside unified-diff hunks."""
-    redacted: list[str] = []
-    in_hunk = False
-    seen: set[int] = set()
-    for number, line in enumerate(literal_lf_lines(prompt), start=1):
-        if line.startswith("diff --git "):
-            in_hunk = False
-        elif line.startswith("@@"):
-            in_hunk = True
-        if number in finding_lines:
-            if not in_hunk or not line.startswith("-") or line.startswith("--- "):
-                return None
-            ending = "\n" if line.endswith("\n") else ""
-            redacted.append("-<redacted deleted line>" + ending)
-            seen.add(number)
-        else:
-            redacted.append(line)
-    return "".join(redacted) if seen == finding_lines else None
-
-
-def trufflehog_scan(
-    trufflehog_bin: str,
-    source_args: list[str],
-    cwd: Path,
-    *,
-    stdin: object,
-    env: dict[str, str],
-) -> subprocess.CompletedProcess[str]:
-    return run(
-        [
-            trufflehog_bin, *source_args,
-            "--json", "--no-color", "--results=verified,unknown",
-            "--fail", "--fail-on-scan-errors", "--no-update",
-        ],
-        cwd,
-        stdin=stdin,
-        check=False,
-        env=env,
-    )
-
-
-def scan_outgoing_review_pack(repo: Path, prompt: str) -> str:
+def scan_outgoing_review_pack(repo: Path, prompt: str) -> None:
     trufflehog_bin = find_command("trufflehog", repo)
     if not trufflehog_bin:
         raise SystemExit(
@@ -1748,41 +1680,29 @@ def scan_outgoing_review_pack(repo: Path, prompt: str) -> str:
         # Filesystem preserves read/extraction failures; stdin does not honor
         # inline ignore tags, including decoded ones. Both must pass. A binary
         # file descriptor preserves exact bytes and avoids stdin pipe buffering.
-        filesystem = trufflehog_scan(
-            trufflehog_bin, ["filesystem", str(pack_path)], Path(tempdir),
-            stdin=None, env=scanner_env,
-        )
-        if filesystem.returncode == TRUFFLEHOG_FINDINGS_EXIT_CODE:
-            finding_lines = trufflehog_finding_lines(filesystem.stdout)
-            redacted = redact_deleted_diff_lines(prompt, finding_lines) if finding_lines else None
-            if redacted is None:
-                raise SystemExit(
-                    "refusing to send review pack: TruffleHog found credentials; "
-                    "remove credential material from selected changes, prompt files, and datasets, then rerun"
-                )
-            pack_path.write_bytes(redacted.encode("utf-8"))
-            prompt = redacted
-        elif filesystem.returncode != 0:
-            raise SystemExit("refusing to send review pack: TruffleHog could not complete the scan")
-
-        # The final, possibly redacted pack must pass both sources. The
-        # filesystem scan is repeated because the first run may have detected
-        # deletion-only material that was removed above.
-        for source_args in ((["filesystem", str(pack_path)]), (["stdin"])):
-            with pack_path.open("rb") as pack_input:
-                result = trufflehog_scan(
-                    trufflehog_bin, source_args, Path(tempdir),
-                    stdin=None if source_args[0] == "filesystem" else pack_input,
+        with pack_path.open("rb") as pack_input:
+            for source_args, scan_input in ((["filesystem", str(pack_path)], None), (["stdin"], pack_input)):
+                result = run(
+                    [
+                        trufflehog_bin, *source_args,
+                        "--json", "--no-color", "--results=verified,unknown",
+                        "--fail", "--fail-on-scan-errors", "--no-update",
+                    ],
+                    Path(tempdir),
+                    stdin=scan_input,
+                    check=False,
                     env=scanner_env,
                 )
-            if result.returncode == TRUFFLEHOG_FINDINGS_EXIT_CODE:
-                raise SystemExit(
-                    "refusing to send review pack: TruffleHog found credentials; "
-                    "remove credential material from selected changes, prompt files, and datasets, then rerun"
-                )
-            if result.returncode != 0:
-                raise SystemExit("refusing to send review pack: TruffleHog could not complete the scan")
-    return prompt
+                if result.returncode == TRUFFLEHOG_FINDINGS_EXIT_CODE:
+                    # Input headings, filenames, and scanner metadata can themselves contain credentials.
+                    raise SystemExit(
+                        "refusing to send review pack: TruffleHog found credentials; "
+                        "remove credential material from selected changes, prompt files, and datasets, then rerun"
+                    )
+                if result.returncode != 0:
+                    raise SystemExit(
+                        "refusing to send review pack: TruffleHog could not complete the scan"
+                    )
 
 
 def bounded_field(text: str, limit: int) -> str:
@@ -6520,11 +6440,7 @@ def run_reviewer(
         raise SystemExit("mixed review requires owner-built pass metadata")
     outgoing = prompt.prompt if isinstance(prompt, ReviewPass) else prompt
     with PreparationProgress("outgoing pack scan and evidence verification"):
-        scanned_outgoing = scan_outgoing_review_pack(repo, outgoing)
-        # Test and embedding callers that provide the legacy side-effect-only
-        # scanner remain safe: the real scanner always returns a string.
-        if scanned_outgoing is not None:
-            outgoing = scanned_outgoing
+        scan_outgoing_review_pack(repo, outgoing)
         verify_evidence(repo, evidence or [])
         verify_mixed_sources(repo, mixed)
     raw = run_engine(args, repo, outgoing)
